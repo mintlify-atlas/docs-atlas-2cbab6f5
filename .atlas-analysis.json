@@ -1,0 +1,113 @@
+{
+  "projectType": "api-service",
+  "projectName": "Styx",
+  "projectDescription": "Distributed membership system that returns probability distributions instead of booleans for truthful node liveness detection.",
+  "theme": "aspen",
+  "primaryColor": "#2563eb",
+  "lightColor": "#60a5fa",
+  "darkColor": "#1e40af",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/how-it-works",
+              "concepts/beliefs",
+              "concepts/witnesses",
+              "concepts/finality",
+              "concepts/partition-detection"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/docker",
+              "deployment/kubernetes",
+              "deployment/configuration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "HTTP API",
+            "pages": [
+              "api/query",
+              "api/report",
+              "api/witnesses"
+            ]
+          },
+          {
+            "group": "CLI Reference",
+            "pages": [
+              "cli/commands",
+              "cli/examples"
+            ]
+          },
+          {
+            "group": "Go SDK",
+            "pages": [
+              "sdk/oracle",
+              "sdk/types",
+              "sdk/witness"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Advanced",
+        "groups": [
+          {
+            "group": "Architecture",
+            "pages": [
+              "advanced/system-design",
+              "advanced/trust-scoring",
+              "advanced/byzantine-fault-tolerance"
+            ]
+          },
+          {
+            "group": "Formal Verification",
+            "pages": [
+              "advanced/tla-specification"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Probabilistic membership queries with confidence levels",
+    "Witness-based distributed reporting system",
+    "Network partition detection and refusal semantics",
+    "Irreversible death finality with high confidence thresholds",
+    "Trust scoring and Byzantine fault tolerance",
+    "HTTP API and CLI for easy integration",
+    "Formal verification with TLA+ specification"
+  ],
+  "publicApiSurface": [
+    "GET /query?target={id} - Query node liveness status",
+    "POST /report - Submit witness belief report",
+    "POST /witnesses - Register a witness",
+    "GET /health - Health check endpoint",
+    "styx query <node_id> - CLI query command",
+    "styx report <witness> <target> <alive> <dead> <unknown> - CLI report command",
+    "styx health - CLI health check command",
+    "Oracle.Query(target) - Go SDK query method",
+    "Oracle.ReceiveReport(witness, target, belief) - Go SDK report method",
+    "types.Belief - Probability distribution type",
+    "types.NodeID - Node identifier type"
+  ]
+}
