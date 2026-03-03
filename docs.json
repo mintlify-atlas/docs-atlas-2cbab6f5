@@ -59,7 +59,9 @@
             "pages": [
               "api/query",
               "api/report",
-              "api/witnesses"
+              "api/witnesses",
+              "api/health",
+              "api/metrics"
             ]
           },
           {

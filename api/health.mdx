@@ -1,0 +1,109 @@
+---
+title: GET /health
+description: Health check endpoint for liveness and readiness probes
+---
+
+The `/health` endpoint provides a simple health check for the Styx server. This endpoint is used by orchestration systems like Docker and Kubernetes for liveness and readiness probes.
+
+## Endpoint
+
+```
+GET /health
+```
+
+## Authentication
+
+No authentication required.
+
+## Response
+
+Returns a JSON object indicating the server status.
+
+<ResponseField name="status" type="string">
+  Health status of the server. Always returns `"ok"` when the server is running.
+</ResponseField>
+
+<ResponseField name="service" type="string">
+  Service identifier. Always returns `"styx"`.
+</ResponseField>
+
+## Example Request
+
+```bash
+curl http://localhost:8080/health
+```
+
+## Example Response
+
+```json
+{
+  "status": "ok",
+  "service": "styx"
+}
+```
+
+**Status Code:** `200 OK`
+
+## Usage in Docker
+
+The health endpoint is used in Docker health checks:
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+```
+
+## Usage in Kubernetes
+
+### Liveness Probe
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  timeoutSeconds: 3
+  failureThreshold: 3
+```
+
+### Readiness Probe
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 8080
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+```
+
+## CLI Health Check
+
+Use the Styx CLI to check server health:
+
+```bash
+styx health
+```
+
+**Output when healthy:**
+```
+server: healthy
+```
+
+**Output when unhealthy:**
+```
+error: server unreachable
+```
+
+<Note>
+The health endpoint performs a basic availability check. It does not verify the health of dependent services like witness nodes or check the internal state of the Oracle. For production monitoring, use the `/metrics` endpoint with Prometheus.
+</Note>
+
+## Related Endpoints
+
+- [Metrics](/api/metrics) - Prometheus metrics for detailed monitoring
+- [Query](/api/query) - Query node liveness status

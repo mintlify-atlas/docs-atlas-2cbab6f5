@@ -1,0 +1,113 @@
+---
+title: GET /metrics
+description: Prometheus metrics endpoint for monitoring Styx server health
+---
+
+The `/metrics` endpoint exposes Prometheus-compatible metrics for monitoring the Styx server.
+
+## Endpoint
+
+```
+GET /metrics
+```
+
+## Authentication
+
+No authentication required.
+
+## Response Format
+
+The endpoint returns metrics in Prometheus text-based exposition format.
+
+**Content-Type:** `text/plain; version=0.0.4`
+
+## Available Metrics
+
+### styx_up
+
+Indicates whether the Styx server is running.
+
+<ParamField path="styx_up" type="gauge">
+  Server availability indicator. Value is `1` when the server is running.
+</ParamField>
+
+## Example Request
+
+```bash
+curl http://localhost:8080/metrics
+```
+
+## Example Response
+
+```
+# HELP styx_up STYX server is up
+# TYPE styx_up gauge
+styx_up 1
+```
+
+## Usage with Prometheus
+
+Configure Prometheus to scrape the Styx metrics endpoint:
+
+```yaml prometheus.yml
+scrape_configs:
+  - job_name: 'styx'
+    static_configs:
+      - targets: ['localhost:8080']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+```
+
+## Kubernetes ServiceMonitor
+
+For Prometheus Operator in Kubernetes:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: styx-metrics
+  labels:
+    app: styx
+spec:
+  selector:
+    matchLabels:
+      app: styx
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+```
+
+## Grafana Dashboard
+
+Use this query to visualize Styx availability:
+
+```promql
+styx_up{job="styx"}
+```
+
+Create alerts for service downtime:
+
+```yaml
+groups:
+  - name: styx_alerts
+    rules:
+      - alert: StyxDown
+        expr: styx_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Styx server is down"
+          description: "Styx server has been unavailable for more than 1 minute"
+```
+
+<Note>
+The current implementation provides basic availability metrics. Future versions may include additional metrics for query latency, witness count, belief distributions, and partition detection events.
+</Note>
+
+## Related Endpoints
+
+- [Health Check](/api/health) - Simple health check for liveness probes
+- [Query](/api/query) - Query node liveness status
