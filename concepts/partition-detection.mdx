@@ -1,0 +1,401 @@
+---
+title: Partition Detection
+description: Network partition detection and handling split realities in Styx
+---
+
+Network partitions create **split realities** where different groups of nodes have conflicting views of the world. Styx actively detects partitions and **refuses to answer** queries rather than provide potentially incorrect information.
+
+## The Problem: Split Realities
+
+During a network partition:
+- **Group A** can communicate with Node X and sees it as ALIVE
+- **Group B** cannot reach Node X and suspects it's DEAD
+- Both groups have valid but conflicting evidence
+
+<Warning>
+Returning a single answer during a partition would be **dishonest**. The truth is context-dependent: Node X is alive from Group A's perspective but unreachable from Group B's perspective.
+</Warning>
+
+## Partition States
+
+Styx tracks three partition states:
+
+```go source/partition/detector.go
+type PartitionState int
+
+const (
+    // NoPartition detected
+    NoPartition PartitionState = iota
+    // SuspectedPartition based on evidence
+    SuspectedPartition
+    // ConfirmedPartition with split realities
+    ConfirmedPartition
+)
+```
+
+## Split Reality Detection
+
+A split reality is detected when witnesses divide into groups with conflicting beliefs:
+
+```go source/partition/detector.go
+type WitnessGroup struct {
+    Witnesses []types.NodeID
+    // What this group believes about targets
+    Beliefs map[types.NodeID]types.Belief
+}
+
+type SplitReality struct {
+    Groups       []WitnessGroup
+    Disagreement float64
+    Ambiguous    []types.NodeID // nodes with conflicting status
+}
+```
+
+## Detection Algorithm
+
+The partition detector analyzes witness reports to identify splits:
+
+```go source/partition/detector.go
+const disagreementThreshold = 0.4
+
+func (d *Detector) Analyze(
+    reports []witness.WitnessReport,
+    target types.NodeID,
+) (PartitionState, *SplitReality) {
+    if len(reports) < 2 {
+        return NoPartition, nil
+    }
+
+    // Check for disagreement patterns
+    aliveVotes := 0
+    deadVotes := 0
+    unknownVotes := 0
+
+    for _, r := range reports {
+        switch r.Belief.Dominant() {
+        case types.StateAlive:
+            aliveVotes++
+        case types.StateDead:
+            deadVotes++
+        case types.StateUnknown:
+            unknownVotes++
+        }
+    }
+
+    total := len(reports)
+
+    // If witnesses strongly disagree, suspect partition
+    if aliveVotes > 0 && deadVotes > 0 {
+        disagreement := float64(min(aliveVotes, deadVotes)) / float64(total)
+
+        if disagreement > d.disagreementThreshold {
+            // Confirmed split - some see alive, some see dead
+            return ConfirmedPartition, createSplitReality(reports, target)
+        }
+
+        // Some disagreement but not extreme
+        return SuspectedPartition, nil
+    }
+
+    // High unknown votes also suggest partition
+    if float64(unknownVotes)/float64(total) > 0.5 {
+        return SuspectedPartition, nil
+    }
+
+    return NoPartition, nil
+}
+```
+
+### Disagreement Threshold
+
+<Accordion title="Threshold = 0.4 (40%)">
+If more than 40% of witnesses disagree on the dominant state, a partition is confirmed. This catches scenarios like:
+- 3 witnesses see ALIVE, 2 see DEAD (40% disagreement)
+- 5 witnesses see DEAD, 3 see ALIVE (37.5% disagreement - suspected but not confirmed)
+</Accordion>
+
+## Creating Witness Groups
+
+When a partition is confirmed, witnesses are divided into groups:
+
+```go source/partition/detector.go
+split := &SplitReality{
+    Disagreement: disagreement,
+    Ambiguous:    []types.NodeID{target},
+}
+
+// Create groups
+aliveGroup := WitnessGroup{
+    Witnesses: make([]types.NodeID, 0),
+    Beliefs:   make(map[types.NodeID]types.Belief),
+}
+deadGroup := WitnessGroup{
+    Witnesses: make([]types.NodeID, 0),
+    Beliefs:   make(map[types.NodeID]types.Belief),
+}
+
+for _, r := range reports {
+    if r.Belief.Dominant() == types.StateAlive {
+        aliveGroup.Witnesses = append(aliveGroup.Witnesses, r.Witness)
+        aliveGroup.Beliefs[target] = r.Belief
+    } else if r.Belief.Dominant() == types.StateDead {
+        deadGroup.Witnesses = append(deadGroup.Witnesses, r.Witness)
+        deadGroup.Beliefs[target] = r.Belief
+    }
+}
+
+split.Groups = []WitnessGroup{aliveGroup, deadGroup}
+```
+
+## Oracle Refusal
+
+When a partition is detected, the Oracle refuses to answer:
+
+```go source/oracle/oracle.go
+// Check partition state
+pState, split := o.partition.Analyze(reports, target)
+result.PartitionState = pState
+
+if pState == partition.ConfirmedPartition {
+    result.Refused = true
+    result.RefusalReason = "network partition detected - witnesses disagree"
+    result.Belief = types.UnknownBelief()
+    if split != nil {
+        result.Disagreement = split.Disagreement
+    }
+    result.Evidence = append(result.Evidence, "partition: witnesses split into groups")
+    return result
+}
+```
+
+<Note>
+**This is a feature, not a bug**. Refusing to answer is more honest than guessing during a partition.
+</Note>
+
+## Detection Examples
+
+### Example 1: Clear Partition
+
+Witnesses split 50/50:
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.9, 0.05, 0.05)},  // ALIVE
+    {Witness: w2, Belief: MustBelief(0.85, 0.1, 0.05)},  // ALIVE
+    {Witness: w3, Belief: MustBelief(0.05, 0.9, 0.05)},  // DEAD
+    {Witness: w4, Belief: MustBelief(0.1, 0.85, 0.05)},  // DEAD
+}
+
+state, split := detector.Analyze(reports, target)
+// state = ConfirmedPartition
+// split.Disagreement = 0.5 (50%)
+// split.Groups = 2 groups (2 witnesses each)
+```
+
+Oracle response:
+```json
+{
+  "target": "node-x",
+  "belief": "[A:0% D:0% U:100%]",
+  "refused": true,
+  "refusalReason": "network partition detected - witnesses disagree",
+  "disagreement": 0.5,
+  "partitionState": "CONFIRMED_PARTITION"
+}
+```
+
+### Example 2: Suspected Partition
+
+Some disagreement but not extreme:
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.8, 0.1, 0.1)},  // ALIVE
+    {Witness: w2, Belief: MustBelief(0.75, 0.15, 0.1)}, // ALIVE
+    {Witness: w3, Belief: MustBelief(0.7, 0.2, 0.1)},  // ALIVE
+    {Witness: w4, Belief: MustBelief(0.2, 0.7, 0.1)},  // DEAD (minority)
+}
+
+state, split := detector.Analyze(reports, target)
+// state = SuspectedPartition (25% disagreement < 40% threshold)
+// split = nil (not confirmed)
+```
+
+Oracle response:
+```json
+{
+  "target": "node-x",
+  "belief": "[A:65% D:25% U:10%]",
+  "refused": false,
+  "disagreement": 0.3,
+  "partitionState": "SUSPECTED_PARTITION"
+}
+```
+
+<Note>
+Suspected partitions don't trigger refusal, but the high disagreement increases uncertainty (see [Witnesses](/concepts/witnesses)).
+</Note>
+
+### Example 3: High Unknown Votes
+
+Many witnesses uncertain:
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.3, 0.2, 0.5)},  // UNKNOWN
+    {Witness: w2, Belief: MustBelief(0.2, 0.2, 0.6)},  // UNKNOWN
+    {Witness: w3, Belief: MustBelief(0.25, 0.25, 0.5)}, // UNKNOWN
+}
+
+state, split := detector.Analyze(reports, target)
+// state = SuspectedPartition (>50% unknown votes)
+// Suggests witnesses themselves are partitioned or experiencing issues
+```
+
+### Example 4: No Partition
+
+Witnesses agree:
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.9, 0.05, 0.05)},  // ALIVE
+    {Witness: w2, Belief: MustBelief(0.85, 0.1, 0.05)},  // ALIVE
+    {Witness: w3, Belief: MustBelief(0.88, 0.07, 0.05)}, // ALIVE
+}
+
+state, split := detector.Analyze(reports, target)
+// state = NoPartition
+// All witnesses agree on ALIVE
+```
+
+## Partition vs. Death
+
+How does Styx distinguish between a partition and actual death?
+
+<CardGroup cols={2}>
+  <Card title="Partition Indicators" icon="split">
+    - Witnesses split into groups
+    - Both groups have reasonable confidence
+    - Disagreement > 40%
+    - Result: **Refuse to answer**
+  </Card>
+  <Card title="Death Indicators" icon="skull">
+    - Witnesses agree (disagreement < 20%)
+    - Dead confidence > 85%
+    - 3+ witnesses
+    - Non-timeout evidence present
+    - Result: **Declare dead**
+  </Card>
+</CardGroup>
+
+## Refusal Policy
+
+```go source/partition/detector.go
+// ShouldRefuseAnswer returns true if partition makes answering dishonest
+// STYX refuses to guess during partitions
+func (d *Detector) ShouldRefuseAnswer() bool {
+    d.mu.RLock()
+    defer d.mu.RUnlock()
+    return d.state == ConfirmedPartition
+}
+```
+
+Only **confirmed** partitions trigger refusal. Suspected partitions allow answering but with increased uncertainty.
+
+## Edge Cases
+
+### Insufficient Reports
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.8, 0.1, 0.1)},
+}
+
+state, split := detector.Analyze(reports, target)
+// state = NoPartition
+// Reason: Need at least 2 reports to detect disagreement
+```
+
+### Three-Way Split
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.8, 0.1, 0.1)},   // ALIVE
+    {Witness: w2, Belief: MustBelief(0.1, 0.8, 0.1)},   // DEAD
+    {Witness: w3, Belief: MustBelief(0.2, 0.2, 0.6)},   // UNKNOWN
+}
+
+state, split := detector.Analyze(reports, target)
+// state = ConfirmedPartition
+// Groups: aliveGroup (w1), deadGroup (w2)
+// w3 not assigned to either group (dominant = UNKNOWN)
+```
+
+### Asymmetric Split
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.9, 0.05, 0.05)},  // ALIVE
+    {Witness: w2, Belief: MustBelief(0.05, 0.9, 0.05)},  // DEAD
+    {Witness: w3, Belief: MustBelief(0.05, 0.9, 0.05)},  // DEAD
+}
+
+state, split := detector.Analyze(reports, target)
+// Disagreement = min(1, 2) / 3 = 0.33 (33%)
+// state = SuspectedPartition (below 40% threshold)
+// Minority witness (w1) doesn't trigger confirmed partition
+```
+
+## Integration with Finality
+
+Partition detection **prevents** premature death declarations:
+
+```go source/finality/engine.go
+// Check disagreement isn't too high
+disagreement := calculateDisagreement(witnessReports)
+if disagreement > MaxDisagreement {  // 0.2 (20%)
+    return ErrInsufficientEvidence
+}
+```
+
+<Warning>
+If disagreement exceeds 20%, the finality engine rejects death declarations. This prevents declaring death during suspected partitions.
+</Warning>
+
+## Partition Recovery
+
+Once the partition heals:
+
+1. **Witnesses reconnect**: Network communication restored
+2. **Beliefs converge**: Witnesses now see consistent state
+3. **Disagreement drops**: Below 40% threshold
+4. **Oracle resumes**: Can provide answers again
+5. **Finality possible**: If node truly dead, can now be declared
+
+## Key Takeaways
+
+<CardGroup cols={2}>
+  <Card title="Refusal is Honest" icon="hand">
+    During confirmed partitions (>40% disagreement), refusing to answer is more honest than guessing
+  </Card>
+  <Card title="Split Realities" icon="diagram-split-merge">
+    Witnesses are divided into groups with their respective beliefs preserved
+  </Card>
+  <Card title="Prevents False Death" icon="shield-halved">
+    High disagreement blocks finality decisions, preventing partition-induced false death
+  </Card>
+  <Card title="Context-Dependent Truth" icon="location-crosshairs">
+    The "truth" about a node may differ based on network position during a partition
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Finality" icon="lock" href="/concepts/finality">
+    See how low disagreement enables irreversible death decisions
+  </Card>
+  <Card title="Witnesses" icon="users" href="/concepts/witnesses">
+    Learn how disagreement affects belief aggregation
+  </Card>
+</CardGroup>

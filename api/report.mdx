@@ -1,0 +1,87 @@
+---
+title: 'Report Endpoint'
+description: 'Report a witness belief about a target node'
+---
+
+## POST /report
+
+Submit a witness report containing belief values about a target node's liveness. The oracle uses these reports to aggregate and determine the overall status of nodes in the system.
+
+### Request Body
+
+<ParamField body="witness" type="uint64" required>
+  The ID of the witness node submitting the report
+</ParamField>
+
+<ParamField body="target" type="uint64" required>
+  The ID of the target node being reported on
+</ParamField>
+
+<ParamField body="alive" type="float64" required>
+  Confidence score that the target is alive (0.0 to 1.0)
+</ParamField>
+
+<ParamField body="dead" type="float64" required>
+  Confidence score that the target is dead (0.0 to 1.0)
+</ParamField>
+
+<ParamField body="unknown" type="float64" required>
+  Confidence score representing uncertainty (0.0 to 1.0)
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "witness": 1,
+  "target": 42,
+  "alive": 0.9,
+  "dead": 0.0,
+  "unknown": 0.1
+}
+```
+
+### Response
+
+<ResponseField name="status" type="string">
+  Status of the report submission ("accepted")
+</ResponseField>
+
+### Response Example
+
+```json
+{
+  "status": "accepted"
+}
+```
+
+### Error Codes
+
+<ResponseField name="400 Bad Request" type="error">
+  - Invalid JSON in request body
+  - Invalid belief values (must sum to 1.0 and be between 0.0 and 1.0)
+</ResponseField>
+
+<ResponseField name="405 Method Not Allowed" type="error">
+  Request method is not POST
+</ResponseField>
+
+### cURL Example
+
+```bash
+curl -X POST http://localhost:8080/report \
+  -H "Content-Type: application/json" \
+  -d '{
+    "witness": 1,
+    "target": 42,
+    "alive": 0.9,
+    "dead": 0.0,
+    "unknown": 0.1
+  }'
+```
+
+### Notes
+
+- The three belief values (alive, dead, unknown) must sum to 1.0
+- Each belief value must be between 0.0 and 1.0
+- The report is accepted asynchronously with a 202 status code

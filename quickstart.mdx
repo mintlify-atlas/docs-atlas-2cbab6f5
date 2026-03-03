@@ -1,80 +1,354 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quick Start
+description: Get Styx running and make your first queries in 5 minutes
 ---
 
-## Get started in three steps
+This guide will get you from zero to querying node liveness in under 5 minutes.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+You need one of the following:
+- Docker (recommended for quickest start)
+- Go 1.21+ installed
+- curl or similar HTTP client
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
+## Running the Server
+
+<Steps>
+  <Step title="Start the Styx server">
     
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
+    <CodeGroup>
+    ```bash Docker (Recommended)
+    docker pull pawan126/styx
+    docker run -p 8080:8080 pawan126/styx
+    ```
+
+    ```bash Go Run
+    # From source directory
+    go run source/cmd/styx-server/main.go
+    ```
+
+    ```bash Custom Port
+    # Run on port 3000 instead of 8080
+    go run source/cmd/styx-server/main.go 3000
+    ```
+    </CodeGroup>
+
+    You should see:
+    ```
+    styx oracle listening on :8080
+    endpoints:
+      GET  /health          - health check
+      GET  /query?target=ID - query node status
+      POST /report          - submit witness report
+      POST /witnesses       - register witness
+    ```
+
+    <Note>
+    The server creates a new Oracle instance with ID 1 by default (see `source/cmd/styx-server/main.go:17`).
+    </Note>
+  </Step>
+
+  <Step title="Verify server is healthy">
     
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    Check that the server is running:
 
-### Step 2: Deploy your changes
+    ```bash cURL
+    curl http://localhost:8080/health
+    ```
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
+    Expected response:
+    ```json
+    {"status":"ok","service":"styx"}
+    ```
+
+    <Tip>
+    The health endpoint always returns 200 OK if the server is running (see `source/api/server.go:136-139`).
+    </Tip>
+  </Step>
+
+  <Step title="Query a node (with no data)">
     
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    Let's query node 42 before we have any witness reports:
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    ```bash
+    curl "http://localhost:8080/query?target=42"
+    ```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    Response:
+    ```json
+    {
+      "target": 42,
+      "alive_confidence": 0,
+      "dead_confidence": 0,
+      "unknown": 1,
+      "refused": false,
+      "dead": false,
+      "witness_count": 0,
+      "disagreement": 0,
+      "partition_state": "NO_PARTITION",
+      "evidence": ["no witness reports available"]
+    }
+    ```
 
-### Step 3: Go live
+    <Note>
+    With no evidence, Styx returns pure uncertainty (100% unknown). This is the `UnknownBelief()` from `source/types/belief.go:99-105`.
+    </Note>
+  </Step>
+</Steps>
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+## Submitting Witness Reports
 
-## Next steps
+Now let's add some witness reports so the Oracle has data to work with.
 
-Now that you have your docs running, explore these key features:
+<Steps>
+  <Step title="Register a witness (optional)">
+    
+    Witnesses are auto-registered when they submit reports, but you can register them explicitly:
+
+    ```bash
+    curl -X POST http://localhost:8080/witnesses \
+      -H "Content-Type: application/json" \
+      -d '{"id": 10}'
+    ```
+
+    Response:
+    ```json
+    {"status":"registered"}
+    ```
+  </Step>
+
+  <Step title="Submit a witness report">
+    
+    Let's have witness 10 report that node 42 is likely alive:
+
+    ```bash
+    curl -X POST http://localhost:8080/report \
+      -H "Content-Type: application/json" \
+      -d '{
+        "witness": 10,
+        "target": 42,
+        "alive": 0.8,
+        "dead": 0.1,
+        "unknown": 0.1
+      }'
+    ```
+
+    Response:
+    ```json
+    {"status":"accepted"}
+    ```
+
+    <Warning>
+    The three confidence values must sum to exactly 1.0, or you'll get a validation error from `source/types/belief.go:62-66`:
+    ```go
+    sum := alive + dead + unknown
+    if math.Abs(sum-1.0) > BeliefSumEpsilon {
+        return Belief{}, fmt.Errorf("%w: got %f", ErrBeliefInvalidSum, sum)
+    }
+    ```
+    </Warning>
+  </Step>
+
+  <Step title="Add more witness reports">
+    
+    Let's add reports from witnesses 11 and 12:
+
+    ```bash Witness 11 (agrees: node 42 is alive)
+    curl -X POST http://localhost:8080/report \
+      -H "Content-Type: application/json" \
+      -d '{"witness":11,"target":42,"alive":0.75,"dead":0.15,"unknown":0.1}'
+    ```
+
+    ```bash Witness 12 (neutral: uncertain)
+    curl -X POST http://localhost:8080/report \
+      -H "Content-Type: application/json" \
+      -d '{"witness":12,"target":42,"alive":0.4,"dead":0.3,"unknown":0.3}'
+    ```
+  </Step>
+
+  <Step title="Query with aggregated data">
+    
+    Now query node 42 again:
+
+    ```bash
+    curl "http://localhost:8080/query?target=42"
+    ```
+
+    You'll see aggregated results:
+    ```json
+    {
+      "target": 42,
+      "alive_confidence": 0.65,
+      "dead_confidence": 0.18,
+      "unknown": 0.17,
+      "refused": false,
+      "dead": false,
+      "witness_count": 3,
+      "disagreement": 0.12,
+      "partition_state": "NO_PARTITION",
+      "evidence": ["aggregated 3 witness reports"]
+    }
+    ```
+
+    The Oracle has aggregated all three witness reports using `source/witness/aggregator.go`.
+  </Step>
+</Steps>
+
+## Using the CLI
+
+Styx includes a command-line client for easier interaction.
+
+<Steps>
+  <Step title="Install the CLI">
+    ```bash
+    go install github.com/Cintu07/styx/cmd/styx@latest
+    ```
+  </Step>
+
+  <Step title="Query a node">
+    ```bash
+    styx query 42
+    ```
+
+    Output:
+    ```
+    node 42:
+      alive:   65.0%
+      dead:    18.0%
+      unknown: 17.0%
+      status:  likely alive
+    ```
+
+    The CLI formats the response nicely (see `source/cmd/styx/main.go:67-99`).
+  </Step>
+
+  <Step title="Submit a report via CLI">
+    ```bash
+    styx report 13 42 0.9 0.05 0.05
+    ```
+
+    This submits a report from witness 13 about target 42 with confidences [alive=0.9, dead=0.05, unknown=0.05].
+  </Step>
+
+  <Step title="Check server health">
+    ```bash
+    styx health
+    ```
+
+    Output:
+    ```
+    server: healthy
+    ```
+  </Step>
+</Steps>
+
+## Simulating a Partition
+
+Let's see Styx refuse to answer during a network partition.
+
+<Steps>
+  <Step title="Add conflicting witness reports">
+    
+    Submit reports where some witnesses see node 99 as alive, others as dead:
+
+    ```bash Witnesses 20-22: See node 99 as ALIVE
+    curl -X POST http://localhost:8080/report \
+      -d '{"witness":20,"target":99,"alive":0.9,"dead":0.05,"unknown":0.05}'
+    curl -X POST http://localhost:8080/report \
+      -d '{"witness":21,"target":99,"alive":0.85,"dead":0.1,"unknown":0.05}'
+    curl -X POST http://localhost:8080/report \
+      -d '{"witness":22,"target":99,"alive":0.8,"dead":0.1,"unknown":0.1}'
+    ```
+
+    ```bash Witnesses 30-32: See node 99 as DEAD
+    curl -X POST http://localhost:8080/report \
+      -d '{"witness":30,"target":99,"alive":0.05,"dead":0.9,"unknown":0.05}'
+    curl -X POST http://localhost:8080/report \
+      -d '{"witness":31,"target":99,"alive":0.1,"dead":0.85,"unknown":0.05}'
+    curl -X POST http://localhost:8080/report \
+      -d '{"witness":32,"target":99,"alive":0.1,"dead":0.8,"unknown":0.1}'
+    ```
+  </Step>
+
+  <Step title="Query during partition">
+    
+    ```bash
+    curl "http://localhost:8080/query?target=99"
+    ```
+
+    Response:
+    ```json
+    {
+      "target": 99,
+      "alive_confidence": 0,
+      "dead_confidence": 0,
+      "unknown": 1,
+      "refused": true,
+      "refusal_reason": "network partition detected - witnesses disagree",
+      "witness_count": 6,
+      "disagreement": 0.5,
+      "partition_state": "CONFIRMED_PARTITION",
+      "evidence": ["partition: witnesses split into groups"]
+    }
+    ```
+
+    <Check>
+    **Styx refuses to answer!** When the disagreement exceeds 40% (see `source/partition/detector.go:61`), Styx detects a `ConfirmedPartition` and returns `refused: true`.
+    
+    This prevents making a wrong decision during split-brain scenarios.
+    </Check>
+  </Step>
+</Steps>
+
+## Understanding the Response
+
+Let's break down the query response fields:
+
+```go
+// From source/api/server.go:26-39
+type QueryResponse struct {
+    Target          uint64   // Node being queried
+    AliveConfidence float64  // P(node is alive) [0.0-1.0]
+    DeadConfidence  float64  // P(node is dead) [0.0-1.0]
+    Unknown         float64  // P(state unknown) [0.0-1.0]
+    Refused         bool     // Oracle refuses to answer?
+    RefusalReason   string   // Why Oracle refused
+    Dead            bool     // Finality: node declared dead?
+    WitnessCount    int      // Number of witness reports
+    Disagreement    float64  // Witness disagreement level
+    PartitionState  string   // NO_PARTITION, SUSPECTED, or CONFIRMED
+    Evidence        []string // Reasoning for this result
+}
+```
+
+## Environment Variables
+
+The CLI supports custom server URLs:
+
+```bash
+export STYX_SERVER="http://styx.prod.example.com:8080"
+styx query 42
+```
+
+See `source/cmd/styx/main.go:20-23` for the default server configuration.
+
+## Next Steps
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Installation Options" icon="download" href="/installation">
+    Learn about Docker, Go install, and building from source
+  </Card>
+  
+  <Card title="API Reference" icon="code" href="/api-reference">
+    Explore all API endpoints and parameters
+  </Card>
+  
+  <Card title="Concepts" icon="book" href="/concepts">
+    Deep dive into beliefs, witnesses, and finality
+  </Card>
+  
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand how Styx components work together
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

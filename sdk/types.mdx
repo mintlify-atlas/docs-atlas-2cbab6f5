@@ -1,0 +1,503 @@
+---
+title: "Core Types"
+description: "Core types: Belief, NodeID, and Confidence in Styx"
+---
+
+Styx provides three fundamental types that form the basis of its liveness detection system.
+
+## NodeID
+
+Uniquely identifies a node in the distributed system with support for rebirth semantics.
+
+### Type Definition
+
+```go
+type NodeID struct {
+    Base       uint64  // Base identifier (e.g., hash of address or UUID)
+    Generation uint64  // Generation counter - incremented on each identity rebirth
+}
+```
+
+Once STYX declares a node dead with finality, any returning process MUST use a new NodeID with an incremented generation. This prevents zombie nodes and flapping identities.
+
+### Constructors
+
+#### NewNodeID
+
+Creates a new NodeID with generation 0.
+
+```go
+func NewNodeID(base uint64) NodeID
+```
+
+**Example:**
+```go
+nodeID := types.NewNodeID(12345)
+fmt.Println(nodeID) // Output: 0000000000003039.g0
+```
+
+#### WithGeneration
+
+Creates a NodeID with a specific generation.
+
+```go
+func WithGeneration(base, generation uint64) NodeID
+```
+
+**Example:**
+```go
+nodeID := types.WithGeneration(12345, 3)
+fmt.Println(nodeID) // Output: 0000000000003039.g3
+```
+
+### Methods
+
+#### Rebirth
+
+Creates a new identity for a reborn node. This MUST be used when a node returns after being declared dead.
+
+```go
+func (n NodeID) Rebirth() NodeID
+```
+
+**Example:**
+```go
+original := types.NewNodeID(12345)     // generation 0
+reborn := original.Rebirth()           // generation 1
+reborn2 := reborn.Rebirth()            // generation 2
+```
+
+#### IsRebirthOf
+
+Checks if this NodeID is a rebirth of another NodeID.
+
+```go
+func (n NodeID) IsRebirthOf(other NodeID) bool
+```
+
+**Returns:** `true` if the base matches but this generation is higher
+
+**Example:**
+```go
+original := types.NewNodeID(12345)
+reborn := original.Rebirth()
+
+fmt.Println(reborn.IsRebirthOf(original)) // true
+fmt.Println(original.IsRebirthOf(reborn)) // false
+```
+
+#### Equal
+
+Checks if two NodeIDs are equal.
+
+```go
+func (n NodeID) Equal(other NodeID) bool
+```
+
+**Example:**
+```go
+id1 := types.NewNodeID(100)
+id2 := types.NewNodeID(100)
+id3 := id1.Rebirth()
+
+fmt.Println(id1.Equal(id2))  // true
+fmt.Println(id1.Equal(id3))  // false (different generation)
+```
+
+#### String
+
+Returns a human-readable representation.
+
+```go
+func (n NodeID) String() string
+```
+
+**Format:** `{base:016x}.g{generation}`
+
+## Confidence
+
+Represents a value in the range [0.0, 1.0] with bounds enforced at construction.
+
+### Type Definition
+
+```go
+type Confidence struct {
+    // Private field
+}
+```
+
+### Constants
+
+```go
+const ConfidenceEpsilon = 1e-10  // Tolerance for floating-point comparisons
+```
+
+### Constructors
+
+#### NewConfidence
+
+Creates a new Confidence from a raw value.
+
+```go
+func NewConfidence(value float64) (Confidence, error)
+```
+
+**Returns:** Error if value is outside [0.0, 1.0] or is NaN
+
+**Example:**
+```go
+c, err := types.NewConfidence(0.75)
+if err != nil {
+    log.Fatal(err)
+}
+
+// These will error:
+_, err = types.NewConfidence(-0.1)  // Below minimum
+_, err = types.NewConfidence(1.5)   // Above maximum
+_, err = types.NewConfidence(math.NaN()) // NaN
+```
+
+#### MustConfidence
+
+Creates a Confidence or panics if invalid.
+
+```go
+func MustConfidence(value float64) Confidence
+```
+
+**Example:**
+```go
+c := types.MustConfidence(0.75)  // OK
+// types.MustConfidence(1.5)     // Panics!
+```
+
+#### ClampedConfidence
+
+Creates a Confidence, clamping to valid range [0.0, 1.0].
+
+```go
+func ClampedConfidence(value float64) Confidence
+```
+
+**Example:**
+```go
+c1 := types.ClampedConfidence(-0.5)   // Clamped to 0.0
+c2 := types.ClampedConfidence(1.5)    // Clamped to 1.0
+c3 := types.ClampedConfidence(math.NaN()) // Clamped to 0.0
+```
+
+#### ConfidenceZero / ConfidenceOne
+
+Convenience constructors for minimum and maximum confidence.
+
+```go
+func ConfidenceZero() Confidence  // Returns 0.0
+func ConfidenceOne() Confidence   // Returns 1.0
+```
+
+### Methods
+
+#### Value
+
+Returns the raw confidence value.
+
+```go
+func (c Confidence) Value() float64
+```
+
+#### IsZero / IsOne
+
+Checks if confidence is effectively zero or one.
+
+```go
+func (c Confidence) IsZero() bool
+func (c Confidence) IsOne() bool
+```
+
+**Example:**
+```go
+c := types.ConfidenceZero()
+fmt.Println(c.IsZero())  // true
+```
+
+#### Equal
+
+Checks if two confidences are equal within tolerance.
+
+```go
+func (c Confidence) Equal(other Confidence) bool
+```
+
+#### Less
+
+Checks if this confidence is less than another.
+
+```go
+func (c Confidence) Less(other Confidence) bool
+```
+
+**Example:**
+```go
+c1 := types.MustConfidence(0.3)
+c2 := types.MustConfidence(0.7)
+
+fmt.Println(c1.Less(c2))  // true
+fmt.Println(c2.Less(c1))  // false
+```
+
+#### String
+
+Returns a human-readable representation.
+
+```go
+func (c Confidence) String() string
+```
+
+**Format:** `{value*100:.2f}%`
+
+## Belief
+
+Represents a probability distribution over node liveness states.
+
+### Type Definition
+
+```go
+type Belief struct {
+    // Private fields: alive, dead, unknown (all Confidence)
+}
+```
+
+**Invariant:** alive + dead + unknown = 1.0 (within floating-point tolerance)
+
+### BeliefState
+
+The dominant state of a belief distribution.
+
+```go
+type BeliefState int
+
+const (
+    StateUnknown BeliefState = iota  // Liveness state is unknown
+    StateAlive                        // Node is believed to be alive
+    StateDead                         // Node is believed to be dead
+)
+```
+
+### Constants
+
+```go
+const CertaintyThreshold = 0.95   // Threshold for "certain" beliefs
+const DominantMargin = 0.1        // Margin required for dominant state
+const BeliefSumEpsilon = 1e-9     // Tolerance for belief sum validation
+```
+
+### Constructors
+
+#### NewBelief
+
+Creates a new Belief from raw confidence values.
+
+```go
+func NewBelief(alive, dead, unknown float64) (Belief, error)
+```
+
+**Returns:** Error if values don't sum to 1.0 (within tolerance)
+
+**Example:**
+```go
+belief, err := types.NewBelief(0.7, 0.2, 0.1)
+if err != nil {
+    log.Fatal(err)
+}
+
+// This will error (sum is 0.8, not 1.0):
+_, err = types.NewBelief(0.5, 0.2, 0.1)
+```
+
+#### MustBelief
+
+Creates a Belief or panics if invalid.
+
+```go
+func MustBelief(alive, dead, unknown float64) Belief
+```
+
+**Example:**
+```go
+belief := types.MustBelief(0.8, 0.15, 0.05)
+// types.MustBelief(0.5, 0.2, 0.1)  // Panics!
+```
+
+#### UnknownBelief
+
+Creates a belief of pure uncertainty (initial state).
+
+```go
+func UnknownBelief() Belief
+```
+
+**Returns:** Belief with alive=0, dead=0, unknown=1.0
+
+**Example:**
+```go
+belief := types.UnknownBelief()
+fmt.Println(belief) // [A:0% D:0% U:100%] → UNKNOWN
+```
+
+#### CertainlyAlive / CertainlyDead
+
+Creates beliefs of absolute certainty. Use with caution.
+
+```go
+func CertainlyAlive() Belief  // alive=1.0, dead=0, unknown=0
+func CertainlyDead() Belief   // alive=0, dead=1.0, unknown=0
+```
+
+**Warning:** `CertainlyDead()` triggers irreversible death semantics.
+
+### Methods
+
+#### Alive / Dead / Unknown
+
+Returns the confidence for each state.
+
+```go
+func (b Belief) Alive() Confidence
+func (b Belief) Dead() Confidence
+func (b Belief) Unknown() Confidence
+```
+
+**Example:**
+```go
+belief := types.MustBelief(0.7, 0.2, 0.1)
+
+fmt.Printf("Alive: %s\n", belief.Alive())     // 70.00%
+fmt.Printf("Dead: %s\n", belief.Dead())       // 20.00%
+fmt.Printf("Unknown: %s\n", belief.Unknown()) // 10.00%
+```
+
+#### IsCertainAlive / IsCertainDead
+
+Checks if the belief exceeds the certainty threshold (0.95).
+
+```go
+func (b Belief) IsCertainAlive() bool
+func (b Belief) IsCertainDead() bool
+```
+
+**Example:**
+```go
+belief1 := types.MustBelief(0.96, 0.02, 0.02)
+belief2 := types.MustBelief(0.7, 0.2, 0.1)
+
+fmt.Println(belief1.IsCertainAlive()) // true (>= 0.95)
+fmt.Println(belief2.IsCertainAlive()) // false (< 0.95)
+```
+
+#### Dominant
+
+Returns the dominant state (highest confidence).
+
+```go
+func (b Belief) Dominant() BeliefState
+```
+
+**Returns:** `StateUnknown` if no clear winner (difference < `DominantMargin`)
+
+**Example:**
+```go
+belief1 := types.MustBelief(0.8, 0.1, 0.1)
+fmt.Println(belief1.Dominant()) // ALIVE
+
+belief2 := types.MustBelief(0.4, 0.35, 0.25)
+fmt.Println(belief2.Dominant()) // UNKNOWN (no clear winner)
+```
+
+#### IsValid
+
+Checks that the belief invariant holds.
+
+```go
+func (b Belief) IsValid() bool
+```
+
+**Returns:** `true` if alive + dead + unknown ≈ 1.0
+
+#### Equal
+
+Checks if two beliefs are equal.
+
+```go
+func (b Belief) Equal(other Belief) bool
+```
+
+#### String
+
+Returns a human-readable representation.
+
+```go
+func (b Belief) String() string
+```
+
+**Format:** `[A:{alive}% D:{dead}% U:{unknown}%] → {dominant_state}`
+
+**Example:**
+```go
+belief := types.MustBelief(0.7, 0.2, 0.1)
+fmt.Println(belief) // [A:70% D:20% U:10%] → ALIVE
+```
+
+## Usage Examples
+
+### Working with NodeID
+
+```go
+// Create a node
+node := types.NewNodeID(12345)
+fmt.Println(node) // 0000000000003039.g0
+
+// Node dies and comes back - must rebirth
+reborn := node.Rebirth()
+fmt.Println(reborn) // 0000000000003039.g1
+
+// Check rebirth relationship
+if reborn.IsRebirthOf(node) {
+    fmt.Println("This is a reborn node")
+}
+```
+
+### Working with Belief
+
+```go
+// Start with unknown belief
+belief := types.UnknownBelief()
+fmt.Println(belief) // [A:0% D:0% U:100%] → UNKNOWN
+
+// Update based on evidence
+belief = types.MustBelief(0.8, 0.15, 0.05)
+fmt.Println(belief) // [A:80% D:15% U:5%] → ALIVE
+
+// Check certainty
+if belief.IsCertainAlive() {
+    fmt.Println("Node is certainly alive")
+} else {
+    fmt.Printf("Dominant state: %s\n", belief.Dominant())
+}
+
+// Access individual confidences
+fmt.Printf("Confidence alive: %s\n", belief.Alive())
+```
+
+### Safe Confidence Handling
+
+```go
+// Validated construction
+c, err := types.NewConfidence(userInput)
+if err != nil {
+    log.Printf("Invalid confidence: %v", err)
+    c = types.ConfidenceZero() // Fallback
+}
+
+// Or use clamping for external data
+c = types.ClampedConfidence(unreliableValue)
+```

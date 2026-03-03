@@ -1,0 +1,213 @@
+---
+title: "Docker Deployment"
+description: "Deploy Styx using Docker and Docker Compose"
+---
+
+## Docker Deployment
+
+Styx provides a multi-stage Dockerfile for building and running the oracle server in a containerized environment.
+
+## Building the Docker Image
+
+The Dockerfile uses a multi-stage build process to create a minimal production image:
+
+```dockerfile
+# Build stage
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+
+# Copy go mod files
+COPY go.mod ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the binary
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o styx-server ./cmd/styx-server
+
+# Final stage
+FROM alpine:latest
+
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /root/
+
+# Copy binary from builder
+COPY --from=builder /app/styx-server .
+
+# Expose port
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+
+# Run
+CMD ["./styx-server"]
+```
+
+Build the image:
+
+```bash
+docker build -t styx:latest .
+```
+
+## Running with Docker
+
+<CodeGroup>
+
+```bash Basic Run
+docker run -d \
+  --name styx \
+  -p 8080:8080 \
+  styx:latest
+```
+
+```bash With Environment Variables
+docker run -d \
+  --name styx \
+  -p 8080:8080 \
+  -e STYX_NODE_ID=1 \
+  styx:latest
+```
+
+```bash With Custom Port
+docker run -d \
+  --name styx \
+  -p 9090:8080 \
+  styx:latest
+```
+
+</CodeGroup>
+
+## Docker Compose
+
+For production deployments, use Docker Compose to manage the Styx service:
+
+```yaml
+version: '3.8'
+
+services:
+  styx:
+    build: .
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    environment:
+      - STYX_NODE_ID=1
+```
+
+### Starting the Service
+
+<CodeGroup>
+
+```bash Start
+docker-compose up -d
+```
+
+```bash View Logs
+docker-compose logs -f styx
+```
+
+```bash Stop
+docker-compose down
+```
+
+```bash Rebuild and Start
+docker-compose up -d --build
+```
+
+</CodeGroup>
+
+## Health Checks
+
+The Docker image includes built-in health checks that monitor the `/health` endpoint:
+
+- **Interval**: 30 seconds
+- **Timeout**: 3 seconds
+- **Start Period**: 5 seconds
+- **Retries**: 3 attempts
+
+Check container health status:
+
+```bash
+docker ps
+```
+
+The STATUS column will show the health status (healthy/unhealthy).
+
+## Multi-Node Deployment
+
+To deploy multiple Styx nodes with Docker Compose:
+
+```yaml
+version: '3.8'
+
+services:
+  styx-node-1:
+    build: .
+    ports:
+      - "8081:8080"
+    environment:
+      - STYX_NODE_ID=1
+    restart: unless-stopped
+
+  styx-node-2:
+    build: .
+    ports:
+      - "8082:8080"
+    environment:
+      - STYX_NODE_ID=2
+    restart: unless-stopped
+
+  styx-node-3:
+    build: .
+    ports:
+      - "8083:8080"
+    environment:
+      - STYX_NODE_ID=3
+    restart: unless-stopped
+```
+
+## Image Details
+
+- **Base Image**: Alpine Linux (minimal footprint)
+- **Build Image**: golang:1.21-alpine
+- **Binary**: Statically compiled Go binary (CGO disabled)
+- **Port**: 8080 (HTTP)
+- **Size**: ~20MB (final image)
+
+## Troubleshooting
+
+### Check Container Logs
+
+```bash
+docker logs styx
+```
+
+### Inspect Health Status
+
+```bash
+docker inspect --format='{{json .State.Health}}' styx | jq
+```
+
+### Test Health Endpoint
+
+```bash
+curl http://localhost:8080/health
+```
+
+### Access Container Shell
+
+```bash
+docker exec -it styx sh
+```

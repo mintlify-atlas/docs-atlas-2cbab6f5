@@ -1,0 +1,384 @@
+---
+title: Witnesses
+description: Witness reporting, trust scoring, and belief aggregation in Styx
+---
+
+Witnesses are nodes that observe and report on the liveness of other nodes. Styx maintains a **trust score** for each witness and aggregates their reports into a unified belief distribution.
+
+## Witness Reports
+
+A witness report contains:
+- **Witness**: The NodeID of the reporting node
+- **Target**: The NodeID being observed
+- **Belief**: The witness's belief distribution about the target
+- **Trust**: The current trust score of this witness
+
+```go source/witness/aggregator.go
+type WitnessReport struct {
+    Witness types.NodeID
+    Target  types.NodeID
+    Belief  types.Belief
+    Trust   TrustScore
+}
+```
+
+## Trust Scoring
+
+Each witness has a trust score in the range [0.1, 1.0] that determines how much weight their reports carry.
+
+### Trust Constants
+
+```go source/witness/registry.go
+type TrustScore float64
+
+const (
+    // MaxTrust is full trust in a witness
+    MaxTrust TrustScore = 1.0
+    // MinTrust is minimum trust (but never zero - always some weight)
+    MinTrust TrustScore = 0.1
+    // DefaultTrust for new witnesses
+    DefaultTrust TrustScore = 0.8
+    // DecayRate per incorrect report
+    DecayRate = 0.1
+    // RecoveryRate per correct report
+    RecoveryRate = 0.05
+)
+```
+
+<Note>
+Trust never drops to zero (minimum 0.1). Even unreliable witnesses retain some influence, preventing complete exclusion.
+</Note>
+
+### Trust Adjustment
+
+Trust scores are adjusted based on report accuracy:
+
+```go source/witness/registry.go
+// RecordCorrect marks a witness report as correct
+// Trust increases slightly
+func (r *Registry) RecordCorrect(id types.NodeID) {
+    w := r.getOrCreate(id)
+    w.CorrectReports++
+    w.Trust += TrustScore(RecoveryRate)
+    if w.Trust > MaxTrust {
+        w.Trust = MaxTrust
+    }
+}
+
+// RecordWrong marks a witness report as wrong
+// P12: Trust decays for bad witnesses
+func (r *Registry) RecordWrong(id types.NodeID) {
+    w := r.getOrCreate(id)
+    w.WrongReports++
+    w.Trust -= TrustScore(DecayRate)
+    if w.Trust < MinTrust {
+        w.Trust = MinTrust
+    }
+}
+```
+
+<Accordion title="Property 12: Witness Trust Decays">
+Witnesses that provide incorrect reports lose trust faster (0.1 per wrong) than they gain it from correct reports (0.05 per correct). This asymmetry creates a high bar for reliability.
+</Accordion>
+
+## Witness Registry
+
+The registry tracks all known witnesses and their trust levels:
+
+```go source/witness/registry.go
+type WitnessRecord struct {
+    ID             types.NodeID
+    Trust          TrustScore
+    CorrectReports int
+    WrongReports   int
+    LastReport     types.Belief
+}
+
+type Registry struct {
+    mu        sync.RWMutex
+    witnesses map[types.NodeID]*WitnessRecord
+}
+```
+
+### Example Usage
+
+```go
+reg := witness.NewRegistry()
+
+// Register a new witness (starts with DefaultTrust = 0.8)
+reg.Register(nodeID)
+
+// Get current trust
+trust := reg.GetTrust(nodeID) // Returns 0.8
+
+// Record correct report
+reg.RecordCorrect(nodeID)
+trust = reg.GetTrust(nodeID) // Now 0.85
+
+// Record wrong report
+reg.RecordWrong(nodeID)
+trust = reg.GetTrust(nodeID) // Now 0.75
+```
+
+## Belief Aggregation
+
+The aggregator combines multiple witness reports into a single belief distribution using trust-weighted averaging.
+
+### Aggregation Algorithm
+
+```go source/witness/aggregator.go
+func (a *Aggregator) Aggregate(reports []WitnessReport) AggregateResult {
+    // Calculate weighted average of beliefs
+    var totalWeight float64
+    var aliveSum, deadSum, unknownSum float64
+
+    for _, r := range reports {
+        trust := float64(a.registry.GetTrust(r.Witness))
+        totalWeight += trust
+
+        aliveSum += r.Belief.Alive().Value() * trust
+        deadSum += r.Belief.Dead().Value() * trust
+        unknownSum += r.Belief.Unknown().Value() * trust
+    }
+
+    avgAlive := aliveSum / totalWeight
+    avgDead := deadSum / totalWeight
+    avgUnknown := unknownSum / totalWeight
+
+    // ... additional processing for disagreement and correlation
+}
+```
+
+### Aggregation Result
+
+```go source/witness/aggregator.go
+type AggregateResult struct {
+    Belief       types.Belief
+    Disagreement float64 // 0 = all agree, 1 = max disagreement
+    WitnessCount int
+    Reports      []WitnessReport
+}
+```
+
+## Disagreement Detection
+
+<Accordion title="Property 10: Disagreement is Preserved">
+When witnesses disagree, Styx tracks the disagreement level and increases uncertainty rather than hiding the conflict.
+</Accordion>
+
+```go source/witness/aggregator.go
+// calculateDisagreement measures variance in witness opinions
+// P10: We track this, not hide it
+func (a *Aggregator) calculateDisagreement(
+    reports []WitnessReport,
+    avgAlive, avgDead float64,
+) float64 {
+    if len(reports) < 2 {
+        return 0
+    }
+
+    var variance float64
+    for _, r := range reports {
+        diffAlive := r.Belief.Alive().Value() - avgAlive
+        diffDead := r.Belief.Dead().Value() - avgDead
+        variance += diffAlive*diffAlive + diffDead*diffDead
+    }
+    variance /= float64(len(reports))
+
+    // Normalize to [0,1]
+    return math.Min(math.Sqrt(variance), 1.0)
+}
+```
+
+When disagreement exceeds 0.3 (30%), the aggregator increases the unknown component:
+
+```go source/witness/aggregator.go
+// P10: High disagreement increases unknown
+if disagreement > 0.3 {
+    // Significant disagreement - widen uncertainty
+    reduction := disagreement * 0.5
+    avgAlive *= (1 - reduction)
+    avgDead *= (1 - reduction)
+    avgUnknown = 1.0 - avgAlive - avgDead
+}
+```
+
+## Correlation Detection
+
+<Accordion title="Property 11: Correlated Witnesses Weaken Confidence">
+If all witnesses report very similar values (correlation > 0.9), they may share a failure mode. Confidence is reduced by 30% to account for this.
+</Accordion>
+
+```go source/witness/aggregator.go
+// detectCorrelation checks if witnesses are too similar
+// P11: Correlated witnesses weaken confidence
+func (a *Aggregator) detectCorrelation(reports []WitnessReport) float64 {
+    if len(reports) < 2 {
+        return 0
+    }
+
+    // Check how similar all reports are
+    first := reports[0].Belief
+    var totalDiff float64
+
+    for i := 1; i < len(reports); i++ {
+        b := reports[i].Belief
+        diffAlive := math.Abs(first.Alive().Value() - b.Alive().Value())
+        diffDead := math.Abs(first.Dead().Value() - b.Dead().Value())
+        totalDiff += diffAlive + diffDead
+    }
+
+    avgDiff := totalDiff / float64(len(reports)-1)
+
+    // Low difference = high correlation
+    return 1.0 - math.Min(avgDiff*2, 1.0)
+}
+```
+
+When correlation is too high:
+
+```go source/witness/aggregator.go
+// P11: Correlated witnesses reduce confidence
+// If witnesses are too similar, increase unknown
+correlation := a.detectCorrelation(reports)
+if correlation > 0.9 {
+    // Too correlated - reduce confidence
+    factor := 0.7
+    avgAlive *= factor
+    avgDead *= factor
+    avgUnknown = 1.0 - avgAlive - avgDead
+}
+```
+
+<Warning>
+High correlation suggests witnesses may share infrastructure or failure modes. Styx compensates by reducing confidence in the aggregated result.
+</Warning>
+
+## Aggregation Examples
+
+### Example 1: Agreement
+
+Three witnesses all report high alive confidence:
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.9, 0.05, 0.05), Trust: 0.8},
+    {Witness: w2, Belief: MustBelief(0.85, 0.10, 0.05), Trust: 0.9},
+    {Witness: w3, Belief: MustBelief(0.95, 0.03, 0.02), Trust: 0.7},
+}
+
+result := aggregator.Aggregate(reports)
+// result.Belief ≈ [A:90% D:6% U:4%]
+// result.Disagreement ≈ 0.05 (low)
+```
+
+### Example 2: Disagreement
+
+Witnesses split on the status:
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.8, 0.1, 0.1), Trust: 0.8},
+    {Witness: w2, Belief: MustBelief(0.2, 0.7, 0.1), Trust: 0.8},
+    {Witness: w3, Belief: MustBelief(0.4, 0.4, 0.2), Trust: 0.7},
+}
+
+result := aggregator.Aggregate(reports)
+// result.Belief ≈ [A:35% D:35% U:30%] (uncertainty increased)
+// result.Disagreement ≈ 0.4 (high)
+```
+
+### Example 3: Trust Weighting
+
+Low-trust witness has less influence:
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.9, 0.05, 0.05), Trust: 0.9}, // Trusted
+    {Witness: w2, Belief: MustBelief(0.9, 0.05, 0.05), Trust: 0.85}, // Trusted
+    {Witness: w3, Belief: MustBelief(0.1, 0.8, 0.1), Trust: 0.2},  // Unreliable
+}
+
+result := aggregator.Aggregate(reports)
+// Result weighted toward w1 and w2 due to higher trust
+// result.Belief ≈ [A:80% D:15% U:5%]
+```
+
+### Example 4: High Correlation
+
+All witnesses report identical values:
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.9, 0.05, 0.05), Trust: 0.8},
+    {Witness: w2, Belief: MustBelief(0.9, 0.05, 0.05), Trust: 0.8},
+    {Witness: w3, Belief: MustBelief(0.9, 0.05, 0.05), Trust: 0.8},
+}
+
+result := aggregator.Aggregate(reports)
+// Correlation detected (> 0.9)
+// Confidence reduced by 30%
+// result.Belief ≈ [A:63% D:3.5% U:33.5%]
+```
+
+## Edge Cases
+
+### No Reports
+
+```go
+result := aggregator.Aggregate([]WitnessReport{})
+// Returns: UnknownBelief() [A:0% D:0% U:100%]
+```
+
+### Single Report
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.8, 0.1, 0.1), Trust: 0.9},
+}
+
+result := aggregator.Aggregate(reports)
+// Returns the single report's belief unchanged
+// Disagreement = 0 (no other reports to disagree with)
+```
+
+### All Witnesses Untrusted
+
+```go
+reports := []WitnessReport{
+    {Witness: w1, Belief: MustBelief(0.8, 0.1, 0.1), Trust: 0.1},
+    {Witness: w2, Belief: MustBelief(0.7, 0.2, 0.1), Trust: 0.1},
+}
+
+result := aggregator.Aggregate(reports)
+// Still aggregates (trust never reaches zero)
+// But effectively low confidence in result
+```
+
+## Key Takeaways
+
+<CardGroup cols={2}>
+  <Card title="Trust-Weighted" icon="scale-balanced">
+    Reports are weighted by witness trust scores, giving reliable witnesses more influence
+  </Card>
+  <Card title="Disagreement Tracked" icon="chart-scatter">
+    High disagreement increases uncertainty rather than being hidden
+  </Card>
+  <Card title="Correlation Detected" icon="link">
+    Too-similar reports trigger a 30% confidence reduction to account for shared failure modes
+  </Card>
+  <Card title="Trust Decays" icon="arrow-down">
+    Incorrect reports reduce trust faster (0.1) than correct ones increase it (0.05)
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Finality" icon="lock" href="/concepts/finality">
+    Learn how overwhelming witness agreement triggers irreversible death
+  </Card>
+  <Card title="Partition Detection" icon="split" href="/concepts/partition-detection">
+    See how extreme disagreement indicates network partitions
+  </Card>
+</CardGroup>

@@ -1,0 +1,369 @@
+---
+title: "Kubernetes Deployment"
+description: "Deploy and manage Styx clusters on Kubernetes"
+---
+
+## Kubernetes Deployment
+
+Styx provides native Kubernetes support with custom resource definitions (CRDs) and production-ready deployment manifests.
+
+## Quick Start
+
+Deploy Styx to your Kubernetes cluster:
+
+```bash
+kubectl apply -f k8s/deployment.yaml
+```
+
+## Deployment Manifest
+
+The standard deployment creates a 3-replica Styx cluster:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: styx
+  labels:
+    app: styx
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: styx
+  template:
+    metadata:
+      labels:
+        app: styx
+    spec:
+      containers:
+        - name: styx
+          image: styx:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+```
+
+## Service Configuration
+
+Styx includes two service types:
+
+### Standard ClusterIP Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: styx
+  labels:
+    app: styx
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: styx
+```
+
+### Headless Service for Direct Pod Access
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: styx-headless
+  labels:
+    app: styx
+spec:
+  type: ClusterIP
+  clusterIP: None
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: styx
+```
+
+## Custom Resource Definition (CRD)
+
+Styx provides a CRD for declarative cluster management:
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: styxclusters.styx.io
+spec:
+  group: styx.io
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                  minimum: 1
+                  default: 3
+                image:
+                  type: string
+                  default: "styx:latest"
+                port:
+                  type: integer
+                  default: 8080
+                resources:
+                  type: object
+                  properties:
+                    cpu:
+                      type: string
+                      default: "100m"
+                    memory:
+                      type: string
+                      default: "128Mi"
+            status:
+              type: object
+              properties:
+                ready:
+                  type: boolean
+                nodes:
+                  type: integer
+                phase:
+                  type: string
+  scope: Namespaced
+  names:
+    plural: styxclusters
+    singular: styxcluster
+    kind: StyxCluster
+    shortNames:
+      - styx
+```
+
+### Install the CRD
+
+```bash
+kubectl apply -f k8s/crd.yaml
+```
+
+### Create a StyxCluster Resource
+
+```yaml
+apiVersion: styx.io/v1
+kind: StyxCluster
+metadata:
+  name: my-styx-cluster
+spec:
+  replicas: 5
+  image: styx:latest
+  port: 8080
+  resources:
+    cpu: "200m"
+    memory: "256Mi"
+```
+
+Apply the custom resource:
+
+```bash
+kubectl apply -f my-styx-cluster.yaml
+```
+
+## RBAC Configuration
+
+The operator requires proper permissions:
+
+<CodeGroup>
+
+```yaml Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: styx-operator
+  namespace: styx-system
+```
+
+```yaml Cluster Role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: styx-operator
+rules:
+  - apiGroups: ["styx.io"]
+    resources: ["styxclusters"]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: ["pods", "services", "configmaps"]
+    verbs: ["*"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["*"]
+```
+
+```yaml Cluster Role Binding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: styx-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: styx-operator
+subjects:
+  - kind: ServiceAccount
+    name: styx-operator
+    namespace: styx-system
+```
+
+</CodeGroup>
+
+## Scaling
+
+<CodeGroup>
+
+```bash Manual Scaling
+kubectl scale deployment styx --replicas=5
+```
+
+```bash View Current Scale
+kubectl get deployment styx
+```
+
+```bash Autoscaling (HPA)
+kubectl autoscale deployment styx \
+  --min=3 \
+  --max=10 \
+  --cpu-percent=80
+```
+
+</CodeGroup>
+
+## Health Monitoring
+
+### Liveness Probe
+
+- **Path**: `/health`
+- **Initial Delay**: 5 seconds
+- **Period**: 10 seconds
+
+### Readiness Probe
+
+- **Path**: `/health`
+- **Initial Delay**: 3 seconds
+- **Period**: 5 seconds
+
+## Resource Management
+
+### Default Resource Allocation
+
+- **CPU Request**: 100m
+- **Memory Request**: 128Mi
+- **CPU Limit**: 500m
+- **Memory Limit**: 256Mi
+
+### Adjust Resources
+
+```bash
+kubectl set resources deployment styx \
+  --requests=cpu=200m,memory=256Mi \
+  --limits=cpu=1,memory=512Mi
+```
+
+## Operations
+
+<CodeGroup>
+
+```bash Check Status
+kubectl get pods -l app=styx
+```
+
+```bash View Logs
+kubectl logs -l app=styx --tail=100 -f
+```
+
+```bash Describe Deployment
+kubectl describe deployment styx
+```
+
+```bash Port Forward
+kubectl port-forward svc/styx 8080:8080
+```
+
+```bash Delete Deployment
+kubectl delete -f k8s/deployment.yaml
+```
+
+</CodeGroup>
+
+## High Availability
+
+For production HA deployments:
+
+1. **Run multiple replicas** (minimum 3)
+2. **Use pod anti-affinity** to spread across nodes
+3. **Configure pod disruption budgets**
+4. **Use the headless service** for direct pod discovery
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: styx-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: styx
+```
+
+## Troubleshooting
+
+### Check Pod Status
+
+```bash
+kubectl get pods -l app=styx -o wide
+```
+
+### View Events
+
+```bash
+kubectl get events --sort-by='.lastTimestamp'
+```
+
+### Exec into Pod
+
+```bash
+kubectl exec -it <pod-name> -- sh
+```
+
+### Test Service Connectivity
+
+```bash
+kubectl run test --rm -it --image=alpine -- wget -qO- http://styx:8080/health
+```

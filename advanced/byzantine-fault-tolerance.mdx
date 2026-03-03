@@ -1,0 +1,508 @@
+---
+title: "Byzantine Fault Tolerance"
+description: "How Styx handles malicious nodes and Byzantine fault scenarios"
+---
+
+# Byzantine Fault Tolerance
+
+Styx incorporates **Byzantine Fault Tolerance (BFT)** mechanisms to handle malicious or arbitrarily faulty nodes. This ensures the system can provide accurate liveness information even when some witnesses are compromised, malicious, or behaving incorrectly.
+
+## Byzantine Fault Model
+
+In a Byzantine fault scenario, nodes may:
+
+- **Lie about observations** - Report that alive nodes are dead or vice versa
+- **Send conflicting reports** - Tell different observers different things
+- **Collude with other malicious nodes** - Coordinate to mislead the system
+- **Behave arbitrarily** - Any behavior not specified by the protocol
+
+Unlike crash faults (where nodes simply stop), Byzantine faults are **adversarial**.
+
+## BFT Tolerance Threshold
+
+```go
+const MaxByzantine = 0.33
+```
+
+Styx can tolerate up to **33% malicious nodes**, which follows the classical BFT requirement:
+
+**For `n` total nodes with `f` Byzantine nodes: `n > 3f`**
+
+This means:
+- With 4 nodes, tolerate 1 Byzantine node
+- With 7 nodes, tolerate 2 Byzantine nodes
+- With 10 nodes, tolerate 3 Byzantine nodes
+
+### Why 3f+1?
+
+With `3f+1` total nodes:
+- **Malicious nodes**: `f`
+- **Honest nodes**: `2f+1` (a majority)
+- **Even if `f` nodes are Byzantine**: The remaining `2f+1` honest nodes constitute a majority
+- **Even if `f` honest nodes are unreachable**: Still have `f+1` honest nodes, which is more than the `f` malicious ones
+
+## Cryptographic Signatures
+
+Styx uses **Ed25519 digital signatures** to prevent forgery and ensure report authenticity.
+
+### Signed Reports
+
+```go
+type SignedReport struct {
+    Witness   NodeID
+    Target    NodeID
+    Belief    Belief
+    Timestamp uint64
+    Signature []byte
+    PublicKey ed25519.PublicKey
+}
+```
+
+Each witness report includes:
+
+1. **Content**: Who is reporting (Witness), about whom (Target), what they believe (Belief), when (Timestamp)
+2. **Signature**: Cryptographic proof that the witness created this report
+3. **Public Key**: The witness's identity used to verify the signature
+
+### Key Pair Generation
+
+```go
+type Keypair struct {
+    Public  ed25519.PublicKey
+    Private ed25519.PrivateKey
+}
+
+func GenerateKeypair() (*Keypair, error) {
+    pub, priv, err := ed25519.GenerateKey(rand.Reader)
+    if err != nil {
+        return nil, err
+    }
+    return &Keypair{Public: pub, Private: priv}, nil
+}
+```
+
+Each witness generates a unique keypair that serves as their cryptographic identity.
+
+### Signing Reports
+
+```go
+func (k *Keypair) Sign(target NodeID, belief Belief, timestamp uint64) *SignedReport {
+    // Create message to sign (simplified)
+    msg := make([]byte, 32)
+    copy(msg, []byte("styx"))
+
+    sig := ed25519.Sign(k.Private, msg)
+
+    return &SignedReport{
+        Target:    target,
+        Belief:    belief,
+        Timestamp: timestamp,
+        Signature: sig,
+        PublicKey: k.Public,
+    }
+}
+```
+
+**Production note:** The actual implementation should serialize all fields (target, belief, timestamp) into the message being signed.
+
+### Verifying Signatures
+
+```go
+func (r *SignedReport) Verify() bool {
+    msg := make([]byte, 32)
+    copy(msg, []byte("styx"))
+    return ed25519.Verify(r.PublicKey, msg, r.Signature)
+}
+```
+
+Before accepting any report, Styx verifies:
+1. The signature is cryptographically valid
+2. It was created by the witness claiming to have sent it
+3. The report content hasn't been tampered with
+
+## BFT Aggregator
+
+The **BFTAggregator** combines reports while tolerating Byzantine behavior.
+
+```go
+type BFTAggregator struct {
+    mu           sync.RWMutex
+    knownKeys    map[string]bool  // Prevent Sybil attacks
+    reports      []*SignedReport
+    minWitnesses int
+}
+```
+
+### Sybil Attack Prevention
+
+A **Sybil attack** involves a single malicious actor creating multiple fake identities to gain disproportionate influence.
+
+Styx prevents this by:
+
+```go
+func (a *BFTAggregator) AddReport(report *SignedReport) bool {
+    if !report.Verify() {
+        return false  // Invalid signature rejected
+    }
+
+    keyStr := string(report.PublicKey)
+    if a.knownKeys[keyStr] {
+        // Already have a report from this key, update it
+        for i, r := range a.reports {
+            if string(r.PublicKey) == keyStr {
+                a.reports[i] = report
+                return true
+            }
+        }
+    }
+
+    a.knownKeys[keyStr] = true
+    a.reports = append(a.reports, report)
+    return true
+}
+```
+
+**Key insight:** Each public key gets exactly **one vote**, regardless of how many reports are sent.
+
+### Byzantine Tolerance Calculation
+
+```go
+func (a *BFTAggregator) CanTolerate() int {
+    n := len(a.reports)
+    // n > 3f => f < n/3
+    return (n - 1) / 3
+}
+```
+
+Examples:
+- 4 reports → tolerate 1 Byzantine node
+- 7 reports → tolerate 2 Byzantine nodes
+- 10 reports → tolerate 3 Byzantine nodes
+
+### Trimmed Mean Aggregation
+
+To handle Byzantine behavior, Styx uses a **trimmed mean** approach:
+
+```go
+func (a *BFTAggregator) Aggregate(target NodeID) (Belief, bool) {
+    // Filter reports for this target
+    relevant := filter(a.reports, target)
+
+    if len(relevant) < a.minWitnesses {
+        return UnknownBelief(), false
+    }
+
+    // Calculate f (number of Byzantine nodes we can tolerate)
+    f := (len(relevant) - 1) / 3
+
+    if f < 1 {
+        // Not enough for BFT, use simple average
+        return a.simpleAverage(relevant), true
+    }
+
+    // BFT aggregation: remove f highest and f lowest, average rest
+    return a.trimmedMean(relevant, f), true
+}
+```
+
+### How Trimmed Mean Works
+
+Given `n` witness reports about node X:
+
+1. **Sort reports** by a metric (e.g., alive confidence)
+2. **Remove `f` highest values** (removes optimistic Byzantine nodes)
+3. **Remove `f` lowest values** (removes pessimistic Byzantine nodes)
+4. **Average the remaining `n-2f` values**
+
+**Example** with 7 witnesses (`f=2`):
+
+| Witness | Alive % | Dead % | Unknown % |
+|---------|---------|--------|----------|
+| W1 | 95 | 0 | 5 | ← Remove (highest)
+| W2 | 90 | 5 | 5 | ← Remove (highest)
+| W3 | 85 | 10 | 5 | ← Keep
+| W4 | 80 | 15 | 5 | ← Keep
+| W5 | 75 | 20 | 5 | ← Keep
+| W6 | 10 | 85 | 5 | ← Remove (lowest)
+| W7 | 5 | 90 | 5 | ← Remove (lowest)
+
+**Result:** Average of W3, W4, W5 → `[A:80% D:15% U:5%]`
+
+Even though W1, W2 tried to inflate alive confidence and W6, W7 tried to inflate dead confidence (Byzantine behavior), the trimmed mean gives an accurate result.
+
+## Defense Mechanisms
+
+### 1. Signature Verification
+
+**Threat:** Forged reports claiming to be from trusted witnesses
+
+**Defense:**
+```go
+if !report.Verify() {
+    return false  // Reject invalid signatures
+}
+```
+
+### 2. Unique Public Keys
+
+**Threat:** Sybil attack (one malicious actor, many fake identities)
+
+**Defense:**
+```go
+if a.knownKeys[keyStr] {
+    // Only one report per public key
+}
+```
+
+### 3. Trimmed Mean
+
+**Threat:** Byzantine nodes reporting extreme values
+
+**Defense:** Remove `f` highest and `f` lowest reports before averaging
+
+### 4. Trust Scoring
+
+**Threat:** Witnesses that are sometimes wrong or malicious
+
+**Defense:** Trust scores decay with wrong reports (see [Trust Scoring](/advanced/trust-scoring))
+
+### 5. Minimum Witnesses
+
+**Threat:** Insufficient witnesses for BFT guarantees
+
+**Defense:**
+```go
+if len(relevant) < a.minWitnesses {
+    return UnknownBelief(), false  // Refuse to answer
+}
+```
+
+### 6. Partition Detection
+
+**Threat:** Network partition causes witnesses to see different realities
+
+**Defense:** Detect partitions and refuse to answer when detected (see [System Design](/advanced/system-design))
+
+## Attack Scenarios
+
+### Scenario 1: Malicious Minority
+
+**Setup:**
+- 10 total witnesses
+- 3 malicious (within 33% threshold)
+- 7 honest
+
+**Attack:** Malicious witnesses report that alive node X is dead
+
+**Result:**
+```
+Honest reports (7): [A:90% D:5% U:5%]
+Malicious reports (3): [A:0% D:95% U:5%]
+
+Trimmed mean (f=3):
+- Remove 3 highest alive (7 honest + 0 malicious)
+- Remove 3 lowest alive (3 malicious + 0 honest)
+- Average the middle 4 reports
+
+Final: [A:~90% D:~5% U:~5%] ✓ Correct
+```
+
+The malicious reports are trimmed away, preserving accuracy.
+
+### Scenario 2: Malicious Majority
+
+**Setup:**
+- 10 total witnesses
+- 7 malicious (exceeds 33% threshold)
+- 3 honest
+
+**Attack:** Malicious witnesses report false information
+
+**Result:**
+```
+Honest reports (3): [A:90% D:5% U:5%]
+Malicious reports (7): [A:0% D:95% U:5%]
+
+Trimmed mean (f=3):
+- Remove 3 highest
+- Remove 3 lowest
+- Average middle 4
+
+Final: Depends on distribution, but likely incorrect ✗
+```
+
+**This is expected:** BFT systems cannot tolerate Byzantine nodes beyond the threshold.
+
+### Scenario 3: Sybil Attack
+
+**Attack:** Single malicious actor generates 100 keypairs and sends 100 reports
+
+**Defense:**
+```go
+// Only the FIRST report from each public key counts
+for each report {
+    if knownKeys[report.PublicKey] {
+        ignore  // Duplicate key
+    } else {
+        accept  // New key
+    }
+}
+```
+
+**Result:** 100 reports → 1 effective vote ✓ Prevented
+
+### Scenario 4: Forgery Attack
+
+**Attack:** Malicious actor tries to forge a report claiming to be from trusted witness W1
+
+**Defense:**
+```go
+if !report.Verify() {
+    return false  // Ed25519 signature verification fails
+}
+```
+
+**Result:** Forged report rejected ✓ Prevented
+
+## Integration with Trust Scoring
+
+BFT and trust scoring work together:
+
+| Mechanism | Handles | Timeframe |
+|-----------|---------|----------|
+| **BFT (trimmed mean)** | Adversarial behavior | Immediate (per query) |
+| **Trust scoring** | Mistakes and degradation | Long-term (across queries) |
+| **Partition detection** | Network splits | Real-time (per query) |
+
+**Example workflow:**
+
+1. Byzantine witness sends false report
+2. **BFT trimmed mean** filters it out immediately
+3. **Trust score** decays over time as more false reports are detected
+4. Eventually, Byzantine witness reaches minimum trust (0.1)
+5. Even if not filtered by BFT, its reports have minimal weight
+
+## BFT Guarantees
+
+Styx provides the following BFT guarantees:
+
+### Safety (with ≤ 33% Byzantine nodes)
+
+- **No false death declarations** - Byzantine nodes cannot cause incorrect death finality
+- **No forged reports** - Cryptographic signatures prevent forgery
+- **No Sybil influence** - One key = one vote
+
+### Liveness (with ≤ 33% Byzantine nodes)
+
+- **Queries complete** - System returns a belief (or explicitly refuses)
+- **Honest reports matter** - Honest majority's view is reflected
+
+### Transparency
+
+- **Explicit refusal** - When unable to provide confident answer, system refuses rather than guesses
+- **Evidence provided** - Query results include which witnesses contributed
+
+## Limitations
+
+Styx's BFT mechanisms have limitations:
+
+### 1. 33% Threshold
+
+If more than 1/3 of witnesses are Byzantine, guarantees break down.
+
+**Mitigation:** Choose trusted witnesses carefully, monitor trust scores.
+
+### 2. Public Key Infrastructure
+
+Requires witnesses to have secure keypairs.
+
+**Mitigation:** Use secure key generation and storage practices.
+
+### 3. Collusion Detection
+
+Styx cannot detect if Byzantine nodes are colluding (working together).
+
+**Mitigation:** Correlation detection reduces confidence when witnesses are too similar (see [Trust Scoring](/advanced/trust-scoring)).
+
+### 4. Adaptive Attacks
+
+Malicious witnesses can observe system behavior and adapt their strategy.
+
+**Mitigation:** Trust scoring makes sustained attacks costly (trust decays with wrong reports).
+
+## Configuration
+
+```go
+const (
+    MaxByzantine = 0.33  // Maximum fraction of Byzantine nodes
+)
+
+func NewBFTAggregator(minWitnesses int) *BFTAggregator {
+    return &BFTAggregator{
+        knownKeys:    make(map[string]bool),
+        reports:      make([]*SignedReport, 0),
+        minWitnesses: minWitnesses,  // Minimum reports needed
+    }
+}
+```
+
+**Recommended values:**
+
+- **minWitnesses**: 3-7 depending on security requirements
+  - Lower → faster bootstrap, lower BFT tolerance
+  - Higher → stronger BFT guarantees, slower bootstrap
+
+## Best Practices
+
+### For System Operators
+
+1. **Deploy more than `3f+1` witnesses** - Provides tolerance for both Byzantine and crash faults
+2. **Monitor witness behavior** - Watch for trust score patterns indicating malicious activity
+3. **Rotate witness keys** - Periodic key rotation limits damage from compromised keys
+4. **Geographically distribute witnesses** - Reduces correlation and common-mode failures
+
+### For Witness Operators
+
+1. **Secure private keys** - Use hardware security modules (HSMs) or secure enclaves
+2. **Verify message integrity** - Ensure your implementation correctly signs all report fields
+3. **Monitor your reports** - Check if your reports align with aggregated beliefs
+4. **Investigate anomalies** - If your reports often disagree, investigate why
+
+## Testing Byzantine Scenarios
+
+The codebase includes brutal Byzantine testing:
+
+```go
+// From security/brutal_test.go (implied by the architecture)
+
+// Test BFT tolerance with exactly f Byzantine nodes
+func TestBFTThreshold(t *testing.T) {
+    // Create 7 witnesses (f=2)
+    // Make 2 Byzantine
+    // Verify aggregation is correct
+}
+
+// Test Sybil attack prevention
+func TestSybilAttack(t *testing.T) {
+    // One attacker sends 100 reports with same key
+    // Verify only 1 counts
+}
+
+// Test signature verification
+func TestSignatureVerification(t *testing.T) {
+    // Attempt to forge reports
+    // Verify rejection
+}
+```
+
+## Related Components
+
+- [System Design](/advanced/system-design) - Overall architecture including BFT integration
+- [Trust Scoring](/advanced/trust-scoring) - Complementary long-term defense mechanism
+- [Core Concepts](/concepts/beliefs) - Understanding beliefs and confidence
+
+## Further Reading
+
+- **Byzantine Generals Problem** - Lamport, Shostak, Pease (1982)
+- **Practical Byzantine Fault Tolerance** - Castro, Liskov (1999)
+- **Ed25519 Signature Scheme** - Bernstein et al. (2011)

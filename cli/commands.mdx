@@ -1,0 +1,158 @@
+---
+title: CLI Commands
+description: Complete reference for all Styx CLI commands, flags, and environment variables
+---
+
+The Styx CLI provides commands for querying node status, submitting witness reports, and checking server health.
+
+## Global Environment Variables
+
+<ParamField path="STYX_SERVER" type="string" default="http://localhost:8080">
+  The Styx server URL to connect to. Override the default server address by setting this environment variable.
+</ParamField>
+
+## Commands
+
+### styx query
+
+Query the status of a node in the truthful membership system.
+
+```bash
+styx query <node_id>
+```
+
+#### Arguments
+
+<ParamField path="node_id" type="string" required>
+  The identifier of the node to query
+</ParamField>
+
+#### Output
+
+The command displays:
+- **alive**: Confidence percentage that the node is alive
+- **dead**: Confidence percentage that the node is dead
+- **unknown**: Percentage of unknown status
+- **status**: Overall assessment (REFUSED, DEAD, likely alive, likely dead, or uncertain)
+
+#### Example
+
+```bash
+styx query node-1
+```
+
+Output:
+```
+node node-1:
+  alive:   75.0%
+  dead:    15.0%
+  unknown: 10.0%
+  status:  likely alive
+```
+
+---
+
+### styx report
+
+Submit a witness report about a target node's status.
+
+```bash
+styx report <witness> <target> <alive> <dead> <unknown>
+```
+
+#### Arguments
+
+<ParamField path="witness" type="string" required>
+  The identifier of the node submitting the report (witness)
+</ParamField>
+
+<ParamField path="target" type="string" required>
+  The identifier of the node being reported on (target)
+</ParamField>
+
+<ParamField path="alive" type="float" required>
+  Confidence value that the target is alive (0.0 to 1.0)
+</ParamField>
+
+<ParamField path="dead" type="float" required>
+  Confidence value that the target is dead (0.0 to 1.0)
+</ParamField>
+
+<ParamField path="unknown" type="float" required>
+  Confidence value representing uncertainty (0.0 to 1.0)
+</ParamField>
+
+#### Response
+
+Returns "report accepted" on success (HTTP 202) or an error status.
+
+#### Example
+
+```bash
+styx report node-1 node-2 0.8 0.1 0.1
+```
+
+Output:
+```
+report accepted
+```
+
+---
+
+### styx health
+
+Check the health status of the Styx server.
+
+```bash
+styx health
+```
+
+#### Arguments
+
+None.
+
+#### Response
+
+Returns "server: healthy" if the server is operational, or "server: unreachable" if the connection fails.
+
+#### Example
+
+```bash
+styx health
+```
+
+Output:
+```
+server: healthy
+```
+
+---
+
+### styx version
+
+Display the Styx CLI version.
+
+```bash
+styx version
+```
+
+#### Arguments
+
+None.
+
+#### Example
+
+```bash
+styx version
+```
+
+Output:
+```
+styx cli v1.0.0
+```
+
+## Exit Codes
+
+All commands follow standard exit code conventions:
+- **0**: Success
+- **1**: Error (invalid arguments, server unreachable, or other failures)

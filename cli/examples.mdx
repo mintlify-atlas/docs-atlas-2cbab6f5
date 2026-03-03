@@ -1,0 +1,250 @@
+---
+title: CLI Examples
+description: Real-world examples and common workflows using the Styx CLI
+---
+
+This page provides practical examples of using the Styx CLI for common tasks and workflows.
+
+## Basic Operations
+
+### Check Server Connectivity
+
+Before performing any operations, verify the Styx server is running:
+
+```bash
+styx health
+```
+
+If using a custom server address:
+
+```bash
+export STYX_SERVER=http://styx.example.com:8080
+styx health
+```
+
+### Query Node Status
+
+Check if a specific node is alive or dead:
+
+```bash
+styx query node-1
+```
+
+Example output:
+```
+node node-1:
+  alive:   85.0%
+  dead:    10.0%
+  unknown: 5.0%
+  status:  likely alive
+```
+
+## Witness Reporting
+
+### Report a Node as Alive
+
+When a witness node determines another node is alive:
+
+```bash
+styx report witness-1 target-node 0.9 0.05 0.05
+```
+
+This indicates 90% confidence alive, 5% dead, 5% unknown.
+
+### Report a Node as Dead
+
+When a witness believes a node has failed:
+
+```bash
+styx report witness-1 target-node 0.1 0.85 0.05
+```
+
+This indicates 10% confidence alive, 85% dead, 5% unknown.
+
+### Report Uncertainty
+
+When a witness cannot determine node status:
+
+```bash
+styx report witness-1 target-node 0.2 0.2 0.6
+```
+
+This indicates high uncertainty (60%) about the target's status.
+
+## Common Workflows
+
+### Monitoring Node Status
+
+Continuously monitor a critical node:
+
+```bash
+while true; do
+  styx query critical-node
+  sleep 10
+done
+```
+
+### Batch Status Checks
+
+Check status of multiple nodes:
+
+```bash
+for node in node-1 node-2 node-3; do
+  echo "Checking $node..."
+  styx query $node
+  echo ""
+done
+```
+
+### Automated Health Monitoring
+
+Create a simple health check script:
+
+```bash
+#!/bin/bash
+
+if styx health > /dev/null 2>&1; then
+  echo "Styx server is operational"
+  exit 0
+else
+  echo "Alert: Styx server is down!"
+  exit 1
+fi
+```
+
+### Multi-Environment Setup
+
+Manage multiple Styx environments:
+
+```bash
+# Production environment
+export STYX_SERVER=http://styx-prod.example.com:8080
+styx query prod-node-1
+
+# Staging environment
+export STYX_SERVER=http://styx-staging.example.com:8080
+styx query staging-node-1
+
+# Local development
+export STYX_SERVER=http://localhost:8080
+styx query local-node-1
+```
+
+## Advanced Usage
+
+### Witness Report Pipeline
+
+Submit reports from multiple witnesses:
+
+```bash
+#!/bin/bash
+
+TARGET="node-5"
+
+# Witness 1 reports node as alive
+styx report witness-1 $TARGET 0.9 0.05 0.05
+
+# Witness 2 reports node as alive
+styx report witness-2 $TARGET 0.85 0.1 0.05
+
+# Witness 3 reports node as alive
+styx report witness-3 $TARGET 0.95 0.03 0.02
+
+# Query aggregated status
+styx query $TARGET
+```
+
+### Error Handling
+
+Robust CLI usage with error handling:
+
+```bash
+#!/bin/bash
+
+NODE_ID="important-node"
+
+if ! styx health > /dev/null 2>&1; then
+  echo "Error: Cannot connect to Styx server"
+  exit 1
+fi
+
+if styx query $NODE_ID | grep -q "likely dead"; then
+  echo "Alert: $NODE_ID appears to be dead!"
+  # Trigger recovery procedures
+  ./restart-node.sh $NODE_ID
+fi
+```
+
+### Parsing Query Output
+
+Extract specific values from query results:
+
+```bash
+#!/bin/bash
+
+OUTPUT=$(styx query node-1)
+STATUS=$(echo "$OUTPUT" | grep "status:" | awk '{print $2}')
+
+if [ "$STATUS" = "DEAD" ]; then
+  echo "Node is confirmed dead"
+elif [ "$STATUS" = "likely" ]; then
+  echo "Node status is uncertain"
+else
+  echo "Node appears operational"
+fi
+```
+
+## Integration Examples
+
+### CI/CD Health Check
+
+Include Styx health checks in deployment pipelines:
+
+```yaml
+# .github/workflows/deploy.yml
+steps:
+  - name: Check Styx Server
+    run: |
+      export STYX_SERVER=${{ secrets.STYX_SERVER }}
+      if ! styx health; then
+        echo "Styx server unhealthy, aborting deployment"
+        exit 1
+      fi
+```
+
+### Kubernetes Liveness Probe
+
+Use Styx CLI in container health checks:
+
+```yaml
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: app
+    livenessProbe:
+      exec:
+        command:
+        - /bin/sh
+        - -c
+        - styx health
+      initialDelaySeconds: 30
+      periodSeconds: 10
+```
+
+### Prometheus Metrics Export
+
+Convert Styx status to Prometheus metrics:
+
+```bash
+#!/bin/bash
+
+NODE="$1"
+OUTPUT=$(styx query $NODE)
+
+ALIVE=$(echo "$OUTPUT" | grep "alive:" | awk '{print $2}' | tr -d '%')
+DEAD=$(echo "$OUTPUT" | grep "dead:" | awk '{print $2}' | tr -d '%')
+
+echo "styx_node_alive_confidence{node=\"$NODE\"} $ALIVE"
+echo "styx_node_dead_confidence{node=\"$NODE\"} $DEAD"
+```

@@ -1,0 +1,435 @@
+---
+title: Installation
+description: Install Styx via Docker, Go, or build from source
+---
+
+Styx can be installed in multiple ways depending on your environment and preferences.
+
+## Docker (Recommended)
+
+The fastest way to get started is using the official Docker image.
+
+### Pull and Run
+
+```bash
+docker pull pawan126/styx
+docker run -p 8080:8080 pawan126/styx
+```
+
+The server will start on port 8080 with these endpoints:
+- `GET /health` - Health check
+- `GET /query?target=ID` - Query node status  
+- `POST /report` - Submit witness report
+- `POST /witnesses` - Register witness
+
+### Custom Port
+
+```bash
+docker run -p 3000:8080 pawan126/styx
+```
+
+This maps container port 8080 to host port 3000.
+
+### Docker Compose
+
+Create a `docker-compose.yml`:
+
+```yaml
+version: '3.8'
+services:
+  styx:
+    image: pawan126/styx
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+```
+
+Run with:
+```bash
+docker-compose up -d
+```
+
+### Health Check
+
+The Docker image includes a built-in health check:
+
+```dockerfile
+# From source/Dockerfile:32-33
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+```
+
+Verify health status:
+```bash
+docker ps
+# Check the STATUS column for "healthy"
+```
+
+## Go Install
+
+Install the Styx CLI and server using Go's package manager.
+
+### Prerequisites
+
+- Go 1.21 or later
+- `$GOPATH/bin` in your `PATH`
+
+### Install Server
+
+```bash
+go install github.com/Cintu07/styx/cmd/styx-server@latest
+```
+
+Run the server:
+```bash
+styx-server
+# Or with custom port:
+styx-server 3000
+```
+
+### Install CLI
+
+```bash
+go install github.com/Cintu07/styx/cmd/styx@latest
+```
+
+Verify installation:
+```bash
+styx version
+# Output: styx cli v1.0.0
+```
+
+### Usage
+
+```bash
+# Query a node
+styx query 42
+
+# Submit a witness report
+styx report 10 42 0.8 0.1 0.1
+
+# Check server health
+styx health
+
+# Use custom server
+export STYX_SERVER="http://localhost:3000"
+styx query 42
+```
+
+See `source/cmd/styx/main.go:54-65` for full CLI usage.
+
+## Build from Source
+
+For development or customization, build Styx from source.
+
+### Prerequisites
+
+<Steps>
+  <Step title="Install Go 1.21+">
+    ```bash
+    go version
+    # Should show: go version go1.21 or later
+    ```
+  </Step>
+
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/Cintu07/styx.git
+    cd styx/source
+    ```
+  </Step>
+
+  <Step title="Download dependencies">
+    ```bash
+    go mod download
+    ```
+
+    The module is minimal (see `source/go.mod:1-3`):
+    ```go
+    module github.com/Cintu07/styx
+    
+    go 1.21
+    ```
+
+    Styx has **zero external dependencies** - only the Go standard library.
+  </Step>
+</Steps>
+
+### Build the Server
+
+<CodeGroup>
+```bash Standard Build
+go build -o styx-server ./cmd/styx-server
+./styx-server
+```
+
+```bash Optimized Build
+CGO_ENABLED=0 go build -ldflags="-s -w" -o styx-server ./cmd/styx-server
+./styx-server
+```
+
+```bash Cross-Compile for Linux
+GOOS=linux GOARCH=amd64 go build -o styx-server-linux ./cmd/styx-server
+```
+</CodeGroup>
+
+### Build the CLI
+
+```bash
+go build -o styx ./cmd/styx
+./styx version
+```
+
+### Run from Source (Development)
+
+<CodeGroup>
+```bash Run Server
+go run ./cmd/styx-server/main.go
+```
+
+```bash Run Server on Custom Port
+go run ./cmd/styx-server/main.go 3000
+```
+
+```bash Run CLI
+go run ./cmd/styx/main.go query 42
+```
+</CodeGroup>
+
+### Run Tests
+
+```bash
+# Run all tests
+go test ./... -v
+
+# Run tests with coverage
+go test ./... -cover
+
+# Run specific package tests
+go test ./types -v
+go test ./oracle -v
+```
+
+## Build Docker Image Locally
+
+Build your own Docker image from source.
+
+<Steps>
+  <Step title="Build the image">
+    
+    From the repository root:
+    
+    ```bash
+    cd source
+    docker build -t styx:local .
+    ```
+
+    The Dockerfile uses a multi-stage build (see `source/Dockerfile:1-37`):
+    ```dockerfile
+    # Build stage
+    FROM golang:1.21-alpine AS builder
+    WORKDIR /app
+    COPY go.mod ./
+    RUN go mod download
+    COPY . .
+    RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o styx-server ./cmd/styx-server
+    
+    # Final stage
+    FROM alpine:latest
+    RUN apk --no-cache add ca-certificates
+    WORKDIR /root/
+    COPY --from=builder /app/styx-server .
+    EXPOSE 8080
+    CMD ["./styx-server"]
+    ```
+  </Step>
+
+  <Step title="Run your image">
+    ```bash
+    docker run -p 8080:8080 styx:local
+    ```
+  </Step>
+
+  <Step title="Tag and push (optional)">
+    ```bash
+    docker tag styx:local your-registry/styx:v1.0.0
+    docker push your-registry/styx:v1.0.0
+    ```
+  </Step>
+</Steps>
+
+## Kubernetes Deployment
+
+Deploy Styx to Kubernetes:
+
+```yaml styx-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: styx
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: styx
+  template:
+    metadata:
+      labels:
+        app: styx
+    spec:
+      containers:
+      - name: styx
+        image: pawan126/styx
+        ports:
+        - containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 3
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: styx
+spec:
+  selector:
+    app: styx
+  ports:
+  - protocol: TCP
+    port: 8080
+    targetPort: 8080
+  type: LoadBalancer
+```
+
+Deploy:
+```bash
+kubectl apply -f styx-deployment.yaml
+kubectl get pods -l app=styx
+```
+
+## Binary Releases
+
+Pre-built binaries are not currently available. Use one of these methods:
+- Docker (recommended for production)
+- `go install` (easiest for CLI)
+- Build from source (for development)
+
+## System Requirements
+
+### Server
+- **CPU:** 1 core minimum, 2+ cores recommended
+- **Memory:** 128 MB minimum, 512 MB recommended
+- **Disk:** 50 MB for binary
+- **Network:** Inbound port 8080 (or custom)
+
+### Dependencies
+- **Go:** 1.21 or later (for building from source)
+- **Docker:** 20.10+ (for container deployment)
+- **OS:** Linux, macOS, or Windows
+
+## Verification
+
+After installation, verify Styx is working:
+
+<Steps>
+  <Step title="Check server is running">
+    ```bash
+    curl http://localhost:8080/health
+    # Expected: {"status":"ok","service":"styx"}
+    ```
+  </Step>
+
+  <Step title="Make a test query">
+    ```bash
+    curl "http://localhost:8080/query?target=1"
+    # Expected: JSON response with unknown=1 (no data yet)
+    ```
+  </Step>
+
+  <Step title="Submit a test report">
+    ```bash
+    curl -X POST http://localhost:8080/report \
+      -H "Content-Type: application/json" \
+      -d '{"witness":1,"target":2,"alive":0.8,"dead":0.1,"unknown":0.1}'
+    # Expected: {"status":"accepted"}
+    ```
+  </Step>
+</Steps>
+
+## Troubleshooting
+
+### Port Already in Use
+
+If port 8080 is taken:
+
+<CodeGroup>
+```bash Change Server Port
+go run ./cmd/styx-server/main.go 3000
+```
+
+```bash Docker Port Mapping
+docker run -p 3000:8080 pawan126/styx
+```
+</CodeGroup>
+
+### Module Download Fails
+
+If `go mod download` fails:
+
+```bash
+# Set Go proxy
+export GOPROXY=https://proxy.golang.org,direct
+go mod download
+```
+
+### Docker Build Fails
+
+Ensure you're in the correct directory:
+
+```bash
+cd source  # Dockerfile is in source/, not root
+docker build -t styx .
+```
+
+## Configuration
+
+Styx currently has minimal configuration. The server:
+
+- Listens on port 8080 by default (configurable via CLI argument)
+- Creates Oracle with node ID 1 (see `source/cmd/styx-server/main.go:17`)
+- Uses default confidence thresholds (see `source/oracle/oracle.go:40-44`)
+
+Future versions will support configuration files and environment variables.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get hands-on with Styx in 5 minutes
+  </Card>
+  
+  <Card title="API Reference" icon="code" href="/api-reference">
+    Explore all endpoints and request formats
+  </Card>
+  
+  <Card title="Deployment Guide" icon="server" href="/deployment">
+    Production deployment best practices
+  </Card>
+  
+  <Card title="Contributing" icon="github" href="/contributing">
+    Help improve Styx
+  </Card>
+</CardGroup>

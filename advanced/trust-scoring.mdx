@@ -1,0 +1,375 @@
+---
+title: "Trust Scoring"
+description: "How Styx's witness trust scoring system works and evolves over time"
+---
+
+# Trust Scoring System
+
+Styx uses a **dynamic trust scoring system** to weight witness reports based on their historical accuracy. This implements **Property 12: Witness trust decays** when witnesses provide incorrect information.
+
+## Overview
+
+Not all witnesses are equally reliable. The trust scoring system:
+
+- Tracks the accuracy of each witness over time
+- Increases trust for correct reports
+- Decreases trust for incorrect reports
+- Never allows trust to reach zero (minimum weight maintained)
+- Influences how much each witness's opinion affects the final belief
+
+## Trust Score Range
+
+```go
+type TrustScore float64
+
+const (
+    MaxTrust     TrustScore = 1.0  // Full trust
+    MinTrust     TrustScore = 0.1  // Minimum (never zero)
+    DefaultTrust TrustScore = 0.8  // New witnesses
+)
+```
+
+### Why Minimum Trust is 0.1 (Not Zero)
+
+Witnesses never lose all influence because:
+
+1. **Past errors don't mean future errors** - A witness that was wrong before might be right now
+2. **Network conditions change** - What appeared wrong might have been a partition
+3. **Bootstrap problem** - If trust reaches zero, a witness can never recover
+4. **Minority reports matter** - Even low-trust witnesses can provide valuable signals
+
+## Trust Evolution
+
+Trust scores evolve based on report accuracy:
+
+```go
+const (
+    DecayRate    = 0.1   // Trust lost per wrong report
+    RecoveryRate = 0.05  // Trust gained per correct report
+)
+```
+
+### Correct Report
+
+When a witness provides a correct report:
+
+```go
+func (r *Registry) RecordCorrect(id NodeID) {
+    w.CorrectReports++
+    w.Trust += TrustScore(RecoveryRate)  // +0.05
+    if w.Trust > MaxTrust {
+        w.Trust = MaxTrust  // Cap at 1.0
+    }
+}
+```
+
+**Example:**
+- Current trust: 0.70
+- After correct report: 0.75
+- After 6 more correct reports: 1.00 (capped)
+
+### Wrong Report
+
+When a witness provides a wrong report:
+
+```go
+func (r *Registry) RecordWrong(id NodeID) {
+    w.WrongReports++
+    w.Trust -= TrustScore(DecayRate)  // -0.10
+    if w.Trust < MinTrust {
+        w.Trust = MinTrust  // Floor at 0.1
+    }
+}
+```
+
+**Example:**
+- Current trust: 0.80
+- After wrong report: 0.70
+- After 7 more wrong reports: 0.10 (floored)
+
+## Asymmetric Recovery
+
+Notice that **trust decays faster than it recovers**:
+
+- **Decay rate**: 0.10 per wrong report
+- **Recovery rate**: 0.05 per correct report
+
+This asymmetry is intentional:
+
+1. **Safety over liveness** - False death declarations are worse than false liveness
+2. **Earn trust slowly** - Witnesses must prove reliability over time
+3. **Lose trust quickly** - Incorrect reports are serious mistakes
+
+## Witness Record Structure
+
+```go
+type WitnessRecord struct {
+    ID             NodeID
+    Trust          TrustScore
+    CorrectReports int
+    WrongReports   int
+    LastReport     Belief
+}
+```
+
+### Tracking Metrics
+
+- **Trust**: Current trust score (what matters for aggregation)
+- **CorrectReports**: Total correct reports (for analysis)
+- **WrongReports**: Total wrong reports (for analysis)
+- **LastReport**: Most recent belief reported by this witness
+
+## How Trust Affects Aggregation
+
+Witness reports are combined using **trust-weighted averaging**:
+
+```go
+func (a *Aggregator) Aggregate(reports []WitnessReport) {
+    var totalWeight float64
+    var aliveSum, deadSum, unknownSum float64
+
+    for _, r := range reports {
+        trust := float64(a.registry.GetTrust(r.Witness))
+        totalWeight += trust
+
+        aliveSum += r.Belief.Alive().Value() * trust
+        deadSum += r.Belief.Dead().Value() * trust
+        unknownSum += r.Belief.Unknown().Value() * trust
+    }
+
+    avgAlive := aliveSum / totalWeight
+    avgDead := deadSum / totalWeight
+    avgUnknown := unknownSum / totalWeight
+    // ...
+}
+```
+
+### Example Calculation
+
+Three witnesses report about node X:
+
+| Witness | Trust | Alive | Dead | Unknown |
+|---------|-------|-------|------|--------|
+| W1 | 1.0 | 0.90 | 0.05 | 0.05 |
+| W2 | 0.7 | 0.80 | 0.10 | 0.10 |
+| W3 | 0.3 | 0.20 | 0.70 | 0.10 |
+
+**Weighted alive calculation:**
+```
+aliveSum = (0.90 × 1.0) + (0.80 × 0.7) + (0.20 × 0.3)
+         = 0.90 + 0.56 + 0.06
+         = 1.52
+
+totalWeight = 1.0 + 0.7 + 0.3 = 2.0
+
+avgAlive = 1.52 / 2.0 = 0.76
+```
+
+Notice that W3's low trust (0.3) means its dissenting opinion (20% alive) has minimal impact compared to the high-trust witnesses.
+
+## Default Trust for New Witnesses
+
+New witnesses start at **DefaultTrust = 0.8**, which is:
+
+- **Higher than minimum** (0.1) - They get meaningful weight from the start
+- **Lower than maximum** (1.0) - They must prove themselves
+- **Optimistic but cautious** - Assumes witnesses are generally honest
+
+This allows the system to bootstrap with new witnesses while still requiring them to build full trust through accurate reporting.
+
+## Trust Registry Operations
+
+### Register a New Witness
+
+```go
+func (r *Registry) Register(id NodeID) {
+    if _, exists := r.witnesses[id]; !exists {
+        r.witnesses[id] = &WitnessRecord{
+            ID:    id,
+            Trust: DefaultTrust,  // 0.8
+        }
+    }
+}
+```
+
+### Get Current Trust
+
+```go
+func (r *Registry) GetTrust(id NodeID) TrustScore {
+    if w, ok := r.witnesses[id]; ok {
+        return w.Trust
+    }
+    return DefaultTrust  // Unknown witness → default trust
+}
+```
+
+### Record a Report
+
+```go
+func (r *Registry) RecordReport(id NodeID, belief Belief) {
+    w := r.getOrCreate(id)
+    w.LastReport = belief
+}
+```
+
+## Trust Score Evolution Examples
+
+### Scenario 1: Reliable Witness
+
+A witness that consistently provides correct reports:
+
+```
+Start:      0.80 (default)
+Correct #1: 0.85
+Correct #2: 0.90
+Correct #3: 0.95
+Correct #4: 1.00 (capped at max)
+Correct #5: 1.00 (stays at max)
+```
+
+**Result:** After 4 correct reports, reaches maximum trust and stays there.
+
+### Scenario 2: Unreliable Witness
+
+A witness that frequently provides wrong reports:
+
+```
+Start:   0.80 (default)
+Wrong #1: 0.70
+Wrong #2: 0.60
+Wrong #3: 0.50
+Wrong #4: 0.40
+Wrong #5: 0.30
+Wrong #6: 0.20
+Wrong #7: 0.10 (floored at min)
+Wrong #8: 0.10 (stays at min)
+```
+
+**Result:** After 7 wrong reports, reaches minimum trust but retains some influence.
+
+### Scenario 3: Recovery from Mistakes
+
+A witness that made mistakes but then improves:
+
+```
+Start:      0.80
+Wrong #1:   0.70
+Wrong #2:   0.60
+Correct #1: 0.65
+Correct #2: 0.70
+Correct #3: 0.75
+Correct #4: 0.80 (back to default)
+Correct #5: 0.85
+Correct #6: 0.90
+```
+
+**Result:** Due to asymmetric rates, it takes 6 correct reports to recover from 2 wrong reports.
+
+### Scenario 4: Mixed Performance
+
+A witness with alternating correct and wrong reports:
+
+```
+Start:      0.80
+Correct:    0.85
+Wrong:      0.75  (net: -0.05)
+Correct:    0.80
+Wrong:      0.70  (net: -0.05)
+Correct:    0.75
+```
+
+**Result:** Gradual decline due to asymmetric rates, even with 50/50 accuracy.
+
+## Integration with Byzantine Fault Tolerance
+
+The trust scoring system complements Styx's BFT mechanisms:
+
+- **Trust scores** handle gradual degradation and mistakes
+- **BFT aggregation** handles malicious behavior and worst-case scenarios
+- **Partition detection** handles network splits that affect trust scoring
+
+See [Byzantine Fault Tolerance](/advanced/byzantine-fault-tolerance) for more details.
+
+## Determining Report Correctness
+
+How does the system know if a report was correct or wrong?
+
+1. **Ground truth from finality** - If a node is declared dead (finality), witnesses who reported high dead confidence were correct
+2. **Eventual consistency** - Over time, the aggregated belief converges to reality
+3. **Causal events** - If a node produces a causal event, witnesses who reported it alive were correct
+4. **Partition resolution** - After a partition heals, the majority view is used to score minority witnesses
+
+## Thread Safety
+
+The witness registry is **thread-safe** using read-write locks:
+
+```go
+type Registry struct {
+    mu        sync.RWMutex
+    witnesses map[NodeID]*WitnessRecord
+}
+```
+
+- **Read operations** (GetTrust, GetRecord): Use `RLock()`
+- **Write operations** (Register, RecordCorrect, RecordWrong): Use `Lock()`
+
+This allows concurrent queries while protecting against race conditions during updates.
+
+## Configuration Tuning
+
+The trust scoring constants can be tuned based on system needs:
+
+| Constant | Default | Purpose | Tuning Guidance |
+|----------|---------|---------|----------------|
+| **MaxTrust** | 1.0 | Ceiling | Don't change (normalized) |
+| **MinTrust** | 0.1 | Floor | Increase for stricter filtering |
+| **DefaultTrust** | 0.8 | Bootstrap | Decrease for more cautious start |
+| **DecayRate** | 0.1 | Penalty | Increase to punish errors more |
+| **RecoveryRate** | 0.05 | Reward | Increase to allow faster recovery |
+
+### Conservative Settings
+```go
+MinTrust = 0.3       // Higher floor
+DefaultTrust = 0.6   // More cautious
+DecayRate = 0.15     // Faster decay
+RecoveryRate = 0.03  // Slower recovery
+```
+
+### Permissive Settings
+```go
+MinTrust = 0.05      // Lower floor
+DefaultTrust = 0.9   // More trusting
+DecayRate = 0.05     // Slower decay
+RecoveryRate = 0.10  // Faster recovery
+```
+
+## Best Practices
+
+### For Witness Operators
+
+1. **Ensure accurate local observations** - Your trust depends on report quality
+2. **Monitor your trust score** - Declining trust indicates systemic issues
+3. **Investigate wrong reports** - Understand why you disagreed with ground truth
+4. **Consider network position** - Witnesses in unusual network positions may see different realities
+
+### For Oracle Operators
+
+1. **Monitor witness trust distribution** - If all witnesses have low trust, investigate
+2. **Remove persistently wrong witnesses** - If trust stays at minimum for long periods
+3. **Diversify witness network positions** - Reduce correlation and improve coverage
+4. **Analyze trust patterns** - Sudden trust drops may indicate partitions or attacks
+
+## Trust Score as a Signal
+
+Low trust scores can indicate:
+
+- **Network partition** - Witness in different partition sees different reality
+- **Clock skew** - Timing issues cause incorrect timeout interpretations
+- **Malicious witness** - Deliberately reporting false information
+- **Buggy implementation** - Software errors in witness's belief computation
+
+## Related Components
+
+- [System Design](/advanced/system-design) - Overall architecture
+- [Byzantine Fault Tolerance](/advanced/byzantine-fault-tolerance) - Handling malicious nodes
+- [Core Concepts](/concepts/beliefs) - Understanding beliefs and confidence

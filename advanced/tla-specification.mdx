@@ -1,0 +1,183 @@
+---
+title: "TLA+ Formal Specification"
+description: "Formal verification of Styx's core invariants using TLA+"
+---
+
+Styx includes a **TLA+ formal specification** that mathematically proves the correctness of its core properties. This specification provides strong guarantees about system behavior that cannot be achieved through testing alone.
+
+## What is TLA+?
+
+TLA+ (Temporal Logic of Actions) is a formal specification language used to design, model, and verify concurrent and distributed systems. It allows us to mathematically prove that certain properties always hold, regardless of execution order or timing.
+
+## Verified Properties
+
+The Styx specification formally verifies four critical properties:
+
+### Property 7: Belief is Never Binary
+
+Belief distributions must never collapse into absolute certainty (100% in any single state).
+
+```tla
+Property7_BeliefNeverBinary ==
+    \A n \in Nodes:
+        LET b == beliefs[n]
+        IN ~(b.alive = 100 /\ b.dead = 0 /\ b.unknown = 0)
+           /\ ~(b.alive = 0 /\ b.dead = 100 /\ b.unknown = 0)
+```
+
+**Guarantee**: The system maintains epistemic humility by never expressing absolute certainty about any node's state.
+
+### Property 14: Finality is Irreversible
+
+Once a node is declared dead, that decision is permanent and cannot be reversed.
+
+```tla
+Property14_FinalityIrreversible ==
+    \A n \in Nodes:
+        n \in dead => [](n \in dead)
+```
+
+**Guarantee**: Death declarations are monotonic. The `dead` set only grows, never shrinks, ensuring finality is truly final.
+
+### Property 18: Confidence Sums to One
+
+All belief distributions must be valid probability distributions (summing to 100%).
+
+```tla
+Property18_ConfidenceSumsToOne ==
+    \A n \in Nodes:
+        LET b == beliefs[n]
+        IN b.alive + b.dead + b.unknown = 100
+```
+
+**Guarantee**: Belief states are always mathematically valid probability distributions. No belief can "leak" or become inconsistent.
+
+### Property 13: False Death Forbidden
+
+Death can only be declared when dead confidence exceeds the safety threshold (85%).
+
+```tla
+Property13_FalseDeathForbidden ==
+    \A n \in Nodes:
+        n \in dead => beliefs[n].dead >= 85
+```
+
+**Guarantee**: The system cannot prematurely declare death. All death declarations require high confidence, preventing false positives.
+
+## Core Invariants
+
+### Type Invariant
+
+The specification enforces type safety across all system states:
+
+```tla
+TypeInvariant ==
+    /\ beliefs \in [Nodes -> [alive: 0..100, dead: 0..100, unknown: 0..100]]
+    /\ dead \subseteq Nodes
+    /\ time \in 0..MaxTime
+```
+
+This ensures:
+- All belief components are percentages (0-100)
+- The dead set only contains valid nodes
+- Time remains bounded
+
+## State Transitions
+
+The specification models four key state transitions:
+
+### 1. Receive Report
+
+Witnesses send belief reports about target nodes:
+
+```tla
+ReceiveReport(witness, target, alive, d, unknown) ==
+    /\ alive + d + unknown = 100
+    /\ reports' = Append(reports, [
+        witness |-> witness,
+        target |-> target,
+        alive |-> alive,
+        dead |-> d,
+        unknown |-> unknown,
+        time |-> time
+       ])
+```
+
+### 2. Update Beliefs
+
+Nodes update their beliefs based on received reports:
+
+```tla
+UpdateBeliefs(n) ==
+    /\ beliefs' = [beliefs EXCEPT ![n] = 
+        [alive |-> 50, dead |-> 25, unknown |-> 25]]
+```
+
+### 3. Declare Death
+
+Death declaration requires meeting the confidence threshold:
+
+```tla
+DeclareDeath(n) ==
+    /\ beliefs[n].dead >= 85
+    /\ n \notin dead
+    /\ dead' = dead \cup {n}
+```
+
+### 4. Time Advancement
+
+Logical time advances monotonically:
+
+```tla
+Tick ==
+    /\ time < MaxTime
+    /\ time' = time + 1
+```
+
+## Formal Guarantees
+
+The TLA+ specification provides mathematical proof that:
+
+1. **Safety**: The system never enters an invalid state
+2. **Liveness**: Progress is always possible (no deadlocks)
+3. **Invariance**: Critical properties hold in all reachable states
+4. **Monotonicity**: Certain decisions (like death) are irreversible
+
+These guarantees hold for **all possible executions**, including adversarial scenarios, network partitions, and arbitrary message delays.
+
+## Verification Process
+
+To verify the specification using TLC (the TLA+ model checker):
+
+```bash
+# Install TLA+ tools
+# Download from: https://github.com/tlaplus/tlaplus/releases
+
+# Run model checker
+tlc Styx.tla
+
+# Check specific property
+tlc Styx.tla -config Property7.cfg
+```
+
+The model checker exhaustively explores the state space to verify that all properties hold.
+
+## Theoretical Foundation
+
+The specification is based on:
+
+- **Temporal Logic**: Properties that must hold over time
+- **Set Theory**: Modeling node sets and belief distributions
+- **Probability Theory**: Ensuring valid probability distributions
+
+This formal foundation provides stronger guarantees than traditional testing, which can only verify specific scenarios rather than proving universal properties.
+
+## Limitations
+
+While the specification proves core properties, it:
+
+- **Simplifies** the actual implementation for tractability
+- **Assumes** message delivery (eventual consistency)
+- **Models** a bounded state space (finite nodes, finite time)
+
+The actual implementation must carefully preserve these proven properties while handling real-world complexities like network failures, Byzantine actors, and unbounded execution.

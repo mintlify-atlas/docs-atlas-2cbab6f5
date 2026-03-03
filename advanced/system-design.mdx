@@ -1,0 +1,326 @@
+---
+title: "System Design"
+description: "Styx's overall architecture, components, and data flow"
+---
+
+# System Design
+
+Styx is a distributed failure detection system that uses **probabilistic beliefs** instead of binary true/false states. The architecture is designed around the core principle that in distributed systems, we cannot know with certainty whether a node is alive or dead.
+
+## Core Architecture
+
+### High-Level Components
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         STYX ORACLE                             │
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────┐    │
+│  │  Partition  │  │   Witness    │  │     Finality       │    │
+│  │  Detector   │  │  Aggregator  │  │     Engine         │    │
+│  └─────────────┘  └──────────────┘  └────────────────────┘    │
+│         │                │                     │                │
+│         └────────────────┴─────────────────────┘                │
+│                          │                                      │
+│                  ┌───────▼──────┐                               │
+│                  │   Witness    │                               │
+│                  │   Registry   │                               │
+│                  └──────────────┘                               │
+└─────────────────────────────────────────────────────────────────┘
+                           │
+                           │ Reports
+                           ▼
+         ┌─────────────────────────────────────┐
+         │        OBSERVER NODES               │
+         │  ┌──────────────┐ ┌──────────────┐ │
+         │  │ Local Belief │ │  Evidence    │ │
+         │  │   Manager    │ │  Collection  │ │
+         │  └──────────────┘ └──────────────┘ │
+         └─────────────────────────────────────┘
+```
+
+### Component Responsibilities
+
+#### Oracle (`oracle/oracle.go`)
+
+The **Oracle** is the main interface to Styx. It:
+
+- Receives witness reports about node liveness
+- Aggregates multiple witness opinions
+- Detects network partitions
+- Refuses to answer when uncertain (never guesses)
+- Manages the finality of death declarations
+
+**Key Methods:**
+- `Query(target NodeID)` - Ask about a node's liveness
+- `QueryWithRequirement()` - Query with specific confidence requirements
+- `ReceiveReport()` - Record a witness report
+- `RegisterWitness()` - Add a trusted witness
+
+#### Observer State (`state/observer_state.go`)
+
+Each observer node maintains:
+
+- **Local beliefs** about all known nodes
+- **Logical clock** for causal ordering
+- **Evidence sets** that support each belief
+
+Observers continuously collect evidence through:
+- Direct probes/health checks
+- Causal events from the node
+- Timeout observations
+- Network quality measurements
+
+#### Witness Registry (`witness/registry.go`)
+
+Tracks all known witnesses and their **trust scores**:
+
+```go
+type WitnessRecord struct {
+    ID             NodeID
+    Trust          TrustScore  // [0.1, 1.0]
+    CorrectReports int
+    WrongReports   int
+    LastReport     Belief
+}
+```
+
+Witness trust evolves based on accuracy:
+- **Correct reports**: Trust increases by `RecoveryRate` (0.05)
+- **Wrong reports**: Trust decays by `DecayRate` (0.1)
+- **Minimum trust**: 0.1 (witnesses never reach zero weight)
+- **Default trust**: 0.8 (new witnesses start high)
+
+#### Witness Aggregator (`witness/aggregator.go`)
+
+Combines multiple witness reports into a single belief:
+
+1. **Trust-weighted average** of all witness beliefs
+2. **Disagreement detection** (P10: preserves uncertainty when witnesses disagree)
+3. **Correlation detection** (P11: reduces confidence when witnesses are too similar)
+4. **Uncertainty injection** when disagreement is high
+
+#### Finality Engine (`finality/engine.go`)
+
+Handles **irreversible death declarations** with strict requirements:
+
+- Minimum dead confidence: **85%**
+- Minimum witnesses: **3**
+- Maximum disagreement: **20%**
+- **Must have non-timeout evidence** (P15: silence alone cannot trigger death)
+
+**Once a node is declared dead, it can NEVER be resurrected.**
+
+#### Partition Detector (`partition/detector.go`)
+
+Detects network partitions by analyzing witness disagreement:
+
+- **No partition**: Witnesses agree
+- **Suspected partition**: Some disagreement detected
+- **Confirmed partition**: Witnesses split into conflicting groups (>40% disagreement)
+
+When a partition is confirmed, the Oracle **refuses to answer** rather than guess.
+
+## Data Flow
+
+### Evidence Collection Flow
+
+```
+1. Observer probes target node
+   │
+   ▼
+2. Evidence generated
+   - DirectResponse (alive evidence)
+   - Timeout (weak dead evidence)
+   - CausalEvent (strong alive evidence)
+   │
+   ▼
+3. Evidence added to EvidenceSet
+   │
+   ▼
+4. Belief recomputed using:
+   - Weighted evidence (by age and type)
+   - Exponential decay over time
+   - Uncertainty always >= 5%
+   │
+   ▼
+5. LocalBelief updated
+```
+
+### Witness Report Flow
+
+```
+1. Observer computes local belief
+   │
+   ▼
+2. Reports belief to Oracle
+   │
+   ▼
+3. Oracle receives report
+   │
+   ├─▶ Updates witness registry
+   │
+   ├─▶ Stores report for target node
+   │
+   └─▶ Available for aggregation
+```
+
+### Query Flow
+
+```
+1. Client queries Oracle about node X
+   │
+   ▼
+2. Oracle checks finality engine
+   - If X is dead → return dead belief (certain)
+   │
+   ▼
+3. Oracle gathers witness reports about X
+   │
+   ▼
+4. Partition detector analyzes reports
+   - If partition detected → REFUSE to answer
+   │
+   ▼
+5. Aggregator combines witness beliefs
+   - Trust-weighted average
+   - Disagreement preserved
+   - Correlation detected
+   │
+   ▼
+6. Check confidence requirements
+   - If insufficient → REFUSE to answer
+   │
+   ▼
+7. Return belief with evidence
+```
+
+## Belief Representation
+
+Styx uses a **three-state probability distribution**:
+
+```go
+type Belief struct {
+    alive   Confidence  // P(node is alive)
+    dead    Confidence  // P(node is dead)
+    unknown Confidence  // P(state is unknown)
+}
+// Invariant: alive + dead + unknown = 1.0
+```
+
+**Example beliefs:**
+- `[A:90% D:5% U:5%]` - High confidence node is alive
+- `[A:10% D:80% U:10%]` - High confidence node is dead
+- `[A:30% D:30% U:40%]` - High uncertainty (dominant state: UNKNOWN)
+- `[A:0% D:0% U:100%]` - Pure uncertainty (initial state)
+
+## Key Design Principles
+
+### P4: No Evidence = No Conclusion
+Lack of response (timeout) is **weak evidence**, not proof of death.
+
+### P6: Load ≠ Failure
+GC pauses, scheduling jitter, and high load are detected and do NOT trigger death.
+
+### P10: Disagreement is Preserved
+When witnesses disagree, uncertainty increases rather than averaging to false confidence.
+
+### P11: Correlated Witnesses Weaken Confidence
+If all witnesses report identical beliefs (correlation > 0.9), confidence is reduced to detect potential sybil attacks or common-mode failures.
+
+### P12: Witness Trust Decays
+Witnesses that provide incorrect reports lose trust over time, reducing their influence.
+
+### P13: False Death is Forbidden
+Death requires overwhelming evidence to prevent false positives.
+
+### P14: Death is Irreversible
+Once declared dead, a node can never be resurrected (matches real-world semantics).
+
+### P15: Silence ≠ Death
+Timeout alone cannot trigger death - requires positive evidence of failure.
+
+## API Interface
+
+Styx exposes an HTTP API (`api/server.go`):
+
+### Query Endpoint
+```
+GET /query?target=<node_id>
+```
+
+Returns:
+```json
+{
+  "target": 12345,
+  "alive_confidence": 0.85,
+  "dead_confidence": 0.10,
+  "unknown": 0.05,
+  "refused": false,
+  "dead": false,
+  "witness_count": 5,
+  "disagreement": 0.12,
+  "partition_state": "NO_PARTITION",
+  "evidence": [
+    "aggregated 5 witness reports",
+    "some witness disagreement detected"
+  ]
+}
+```
+
+### Report Endpoint
+```
+POST /report
+{
+  "witness": 67890,
+  "target": 12345,
+  "alive": 0.9,
+  "dead": 0.05,
+  "unknown": 0.05
+}
+```
+
+## Evidence Types
+
+| Evidence Type | Suggests | Weight | Notes |
+|--------------|----------|--------|-------|
+| **DirectResponse** | Alive | 0.6-1.0 | Weight decreases with latency |
+| **Timeout** | Dead | 0.1-0.3 | Always weak (P4, P15) |
+| **CausalEvent** | Alive | 1.0 | Strong proof of recent liveness |
+| **WitnessReport** | Varies | Trust-based | Indirect evidence |
+| **SchedulingJitter** | Uncertain | 0.2-0.4 | Reduces confidence in timeouts |
+| **NetworkInstability** | Uncertain | Varies | Contextual information |
+
+## Logical Time
+
+Styx uses **Lamport logical clocks** (`time/logical.go`) for:
+
+- Causal ordering of events
+- Evidence age calculation
+- Belief decay over time
+
+Evidence decays exponentially with age:
+```
+effective_weight = original_weight × 0.5^(age/half_life)
+```
+
+## Thread Safety
+
+All core components are **thread-safe** using `sync.RWMutex`:
+
+- Oracle handles concurrent queries
+- Registry handles concurrent witness updates
+- Aggregator can process reports in parallel
+
+## Performance Characteristics
+
+- **Query latency**: O(witnesses) - linear in number of witness reports
+- **Evidence storage**: O(nodes × evidence_per_node)
+- **Witness registry**: O(witnesses) lookup time
+- **Partition detection**: O(witnesses) per query
+
+## Next Steps
+
+Learn more about specific subsystems:
+
+- [Trust Scoring](/advanced/trust-scoring) - How witness trust evolves
+- [Byzantine Fault Tolerance](/advanced/byzantine-fault-tolerance) - Handling malicious nodes

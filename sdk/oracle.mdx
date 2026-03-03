@@ -1,0 +1,291 @@
+---
+title: "Oracle"
+description: "Oracle type and methods for querying node liveness in Styx"
+---
+
+The Oracle is the main STYX interface for querying node liveness. It aggregates witness reports, detects network partitions, and returns beliefs about node states.
+
+## Types
+
+### Oracle
+
+The main STYX interface for querying node liveness.
+
+```go
+type Oracle struct {
+    // Private fields
+}
+```
+
+The Oracle maintains:
+- A witness registry
+- A witness report aggregator
+- A finality engine (for irreversible death)
+- A partition detector
+- Historical witness reports
+
+### QueryResult
+
+The full response from the Oracle, containing the belief and metadata about the query.
+
+```go
+type QueryResult struct {
+    Target         types.NodeID        // Node being queried
+    Belief         types.Belief        // Probability distribution over liveness
+    Refused        bool                // True if Oracle refuses to answer
+    RefusalReason  string              // Explanation for refusal
+    Dead           bool                // True if node is declared dead with finality
+    WitnessCount   int                 // Number of witnesses that reported
+    Disagreement   float64             // Degree of witness disagreement (0-1)
+    PartitionState partition.PartitionState // Network partition state
+    Evidence       []string            // Human-readable evidence list
+}
+```
+
+**Fields:**
+- `Target` - The node ID being queried
+- `Belief` - The probability distribution: alive + dead + unknown = 1.0
+- `Refused` - Set to `true` when the Oracle cannot provide a confident answer
+- `RefusalReason` - Explains why the Oracle refused (e.g., "network partition detected")
+- `Dead` - Set to `true` when finality declares the node irreversibly dead
+- `WitnessCount` - Number of witness reports aggregated
+- `Disagreement` - Measures variance in witness opinions (0 = consensus, 1 = maximum disagreement)
+- `PartitionState` - Indicates if a network partition was detected
+- `Evidence` - List of human-readable reasons for the belief
+
+### RequiredConfidence
+
+Specifies minimum confidence thresholds for a query.
+
+```go
+type RequiredConfidence struct {
+    MinAlive   float64  // Minimum confidence required for "alive" state
+    MinDead    float64  // Minimum confidence required for "dead" state
+    MaxUnknown float64  // Maximum acceptable uncertainty
+}
+```
+
+**Predefined Requirements:**
+
+```go
+// DefaultRequirement - accepts any uncertainty
+var DefaultRequirement = RequiredConfidence{
+    MinAlive:   0.0,
+    MinDead:    0.0,
+    MaxUnknown: 1.0,
+}
+
+// StrictRequirement - high confidence queries
+var StrictRequirement = RequiredConfidence{
+    MinAlive:   0.7,
+    MinDead:    0.7,
+    MaxUnknown: 0.3,
+}
+```
+
+## Constructor
+
+### New
+
+Creates a new Oracle instance.
+
+```go
+func New(selfID types.NodeID) *Oracle
+```
+
+**Parameters:**
+- `selfID` - The NodeID of this Oracle instance
+
+**Returns:** A new Oracle ready to receive witness reports
+
+**Example:**
+```go
+selfID := types.NewNodeID(12345)
+oracle := oracle.New(selfID)
+```
+
+## Methods
+
+### RegisterWitness
+
+Adds a trusted witness to the Oracle's registry.
+
+```go
+func (o *Oracle) RegisterWitness(id types.NodeID)
+```
+
+**Parameters:**
+- `id` - The NodeID of the witness to register
+
+**Example:**
+```go
+witness1 := types.NewNodeID(67890)
+oracle.RegisterWitness(witness1)
+```
+
+### ReceiveReport
+
+Records a witness report about a target node.
+
+```go
+func (o *Oracle) ReceiveReport(witnessID, target types.NodeID, belief types.Belief)
+```
+
+**Parameters:**
+- `witnessID` - The witness providing the report
+- `target` - The node being reported on
+- `belief` - The witness's belief about the target's liveness
+
+**Example:**
+```go
+witnessID := types.NewNodeID(67890)
+targetID := types.NewNodeID(11111)
+belief := types.MustBelief(0.8, 0.1, 0.1) // 80% alive, 10% dead, 10% unknown
+
+oracle.ReceiveReport(witnessID, targetID, belief)
+```
+
+### Query
+
+Queries the Oracle about a node's liveness. This is the main API.
+
+```go
+func (o *Oracle) Query(target types.NodeID) QueryResult
+```
+
+**Parameters:**
+- `target` - The node to query
+
+**Returns:** A `QueryResult` containing the belief and metadata
+
+**Key behaviors:**
+- Never returns a simple boolean
+- Always returns uncertainty information
+- May refuse to answer if confidence is too low
+- Checks for finality (irreversible death)
+- Detects network partitions
+
+**Example:**
+```go
+targetID := types.NewNodeID(11111)
+result := oracle.Query(targetID)
+
+if result.Dead {
+    fmt.Println("Node is declared dead with finality")
+} else if result.Refused {
+    fmt.Printf("Oracle refused: %s\n", result.RefusalReason)
+} else {
+    fmt.Printf("Belief: %s\n", result.Belief)
+    fmt.Printf("Witnesses: %d\n", result.WitnessCount)
+    fmt.Printf("Disagreement: %.2f\n", result.Disagreement)
+}
+```
+
+### QueryWithRequirement
+
+Queries the Oracle with specific confidence requirements.
+
+```go
+func (o *Oracle) QueryWithRequirement(target types.NodeID, req RequiredConfidence) QueryResult
+```
+
+**Parameters:**
+- `target` - The node to query
+- `req` - Minimum confidence requirements
+
+**Returns:** A `QueryResult` that either meets the requirements or has `Refused = true`
+
+**Example:**
+```go
+targetID := types.NewNodeID(11111)
+result := oracle.QueryWithRequirement(targetID, oracle.StrictRequirement)
+
+if result.Refused {
+    fmt.Printf("Requirements not met: %s\n", result.RefusalReason)
+} else {
+    // Belief meets strict confidence thresholds
+    fmt.Printf("High-confidence belief: %s\n", result.Belief)
+}
+```
+
+### MustQuery
+
+Queries the Oracle and panics if the Oracle refuses or the node is dead.
+
+```go
+func (o *Oracle) MustQuery(target types.NodeID) types.Belief
+```
+
+**Parameters:**
+- `target` - The node to query
+
+**Returns:** The belief (if successful)
+
+**Panics:**
+- `ErrRefused` - If the Oracle refuses to answer
+- `ErrDead` - If the node is declared dead
+
+**Warning:** Use with caution. This defeats the purpose of STYX by hiding uncertainty.
+
+**Example:**
+```go
+// Only use when you absolutely need a panic-based flow
+targetID := types.NewNodeID(11111)
+belief := oracle.MustQuery(targetID) // May panic!
+fmt.Printf("Belief: %s\n", belief)
+```
+
+## Error Constants
+
+```go
+var (
+    ErrRefused = errors.New("oracle refuses to answer due to uncertainty")
+    ErrDead    = errors.New("node is dead")
+)
+```
+
+## Usage Example
+
+Complete example showing Oracle usage:
+
+```go
+package main
+
+import (
+    "fmt"
+    "github.com/Cintu07/styx/oracle"
+    "github.com/Cintu07/styx/types"
+)
+
+func main() {
+    // Create Oracle
+    selfID := types.NewNodeID(1)
+    o := oracle.New(selfID)
+
+    // Register witnesses
+    w1 := types.NewNodeID(100)
+    w2 := types.NewNodeID(101)
+    o.RegisterWitness(w1)
+    o.RegisterWitness(w2)
+
+    // Receive witness reports
+    targetID := types.NewNodeID(200)
+    o.ReceiveReport(w1, targetID, types.MustBelief(0.9, 0.05, 0.05))
+    o.ReceiveReport(w2, targetID, types.MustBelief(0.85, 0.1, 0.05))
+
+    // Query the Oracle
+    result := o.Query(targetID)
+
+    if result.Dead {
+        fmt.Println("Node is dead with finality")
+    } else if result.Refused {
+        fmt.Printf("Oracle refused: %s\n", result.RefusalReason)
+    } else {
+        fmt.Printf("Target: %s\n", result.Target)
+        fmt.Printf("Belief: %s\n", result.Belief)
+        fmt.Printf("Witnesses: %d\n", result.WitnessCount)
+        fmt.Printf("Disagreement: %.2f\n", result.Disagreement)
+        fmt.Printf("Evidence: %v\n", result.Evidence)
+    }
+}
+```

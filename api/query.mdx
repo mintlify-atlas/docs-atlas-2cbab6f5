@@ -1,0 +1,97 @@
+---
+title: 'Query Endpoint'
+description: 'Query the liveness status of a target node'
+---
+
+## GET /query
+
+Query the oracle for the liveness status of a target node. Returns confidence scores for whether the node is alive, dead, or unknown, along with evidence and partition state information.
+
+### Query Parameters
+
+<ParamField query="target" type="uint64" required>
+  The ID of the node to query liveness status for
+</ParamField>
+
+### Response
+
+<ResponseField name="target" type="uint64">
+  The ID of the queried target node
+</ResponseField>
+
+<ResponseField name="alive_confidence" type="float64">
+  Confidence score that the target node is alive (0.0 to 1.0)
+</ResponseField>
+
+<ResponseField name="dead_confidence" type="float64">
+  Confidence score that the target node is dead (0.0 to 1.0)
+</ResponseField>
+
+<ResponseField name="unknown" type="float64">
+  Confidence score representing uncertainty about the node's status (0.0 to 1.0)
+</ResponseField>
+
+<ResponseField name="refused" type="boolean">
+  Whether the oracle refused to provide a determination
+</ResponseField>
+
+<ResponseField name="refusal_reason" type="string">
+  Explanation for why the query was refused (only present if refused is true)
+</ResponseField>
+
+<ResponseField name="dead" type="boolean">
+  Final determination of whether the node is considered dead
+</ResponseField>
+
+<ResponseField name="witness_count" type="integer">
+  Number of witnesses that contributed to this determination
+</ResponseField>
+
+<ResponseField name="disagreement" type="float64">
+  Measure of disagreement among witnesses (0.0 to 1.0)
+</ResponseField>
+
+<ResponseField name="partition_state" type="string">
+  Current partition state assessment for the target node
+</ResponseField>
+
+<ResponseField name="evidence" type="array">
+  List of evidence strings supporting the determination
+</ResponseField>
+
+### Response Example
+
+```json
+{
+  "target": 42,
+  "alive_confidence": 0.85,
+  "dead_confidence": 0.10,
+  "unknown": 0.05,
+  "refused": false,
+  "dead": false,
+  "witness_count": 5,
+  "disagreement": 0.15,
+  "partition_state": "HEALTHY",
+  "evidence": [
+    "witness 1 reports alive",
+    "witness 2 reports alive"
+  ]
+}
+```
+
+### Error Codes
+
+<ResponseField name="400 Bad Request" type="error">
+  - Missing `target` parameter
+  - Invalid `target` ID format (must be valid uint64)
+</ResponseField>
+
+<ResponseField name="405 Method Not Allowed" type="error">
+  Request method is not GET
+</ResponseField>
+
+### cURL Example
+
+```bash
+curl "http://localhost:8080/query?target=42"
+```

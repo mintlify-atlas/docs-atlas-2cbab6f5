@@ -1,0 +1,306 @@
+---
+title: Beliefs
+description: Understanding probability distributions and the Belief type in Styx
+---
+
+In Styx, node liveness is represented as a **probability distribution** over three mutually exclusive states: ALIVE, DEAD, and UNKNOWN. This is captured in the `Belief` type.
+
+## The Belief Type
+
+A Belief represents a probability distribution where the three components always sum to 1.0:
+
+```go source/types/belief.go
+// Belief represents a probability distribution over node liveness.
+//
+// This represents the probability distribution over three mutually
+// exclusive states: ALIVE, DEAD, and UNKNOWN.
+//
+// Invariant: alive + dead + unknown = 1.0 (within floating-point tolerance)
+type Belief struct {
+    alive   Confidence
+    dead    Confidence
+    unknown Confidence
+}
+```
+
+<Note>
+The sum of `alive + dead + unknown` must always equal 1.0 within a tolerance of `1e-9` (BeliefSumEpsilon).
+</Note>
+
+## Confidence Values
+
+Each component is represented as a `Confidence` type, which enforces the range [0.0, 1.0]:
+
+```go source/types/confidence.go
+type Confidence struct {
+    value float64
+}
+
+// NewConfidence creates a new Confidence from a raw value.
+// Returns an error if the value is outside [0.0, 1.0] or is NaN.
+func NewConfidence(value float64) (Confidence, error) {
+    if math.IsNaN(value) {
+        return Confidence{}, ErrConfidenceNaN
+    }
+    if value < 0.0 {
+        return Confidence{}, fmt.Errorf("%w: %f", ErrConfidenceBelowMinimum, value)
+    }
+    if value > 1.0 {
+        return Confidence{}, fmt.Errorf("%w: %f", ErrConfidenceAboveMaximum, value)
+    }
+    return Confidence{value: value}, nil
+}
+```
+
+<Warning>
+Confidence values are bounds-checked at construction time. Invalid values will return an error rather than silently clamping.
+</Warning>
+
+## Creating Beliefs
+
+### From Raw Values
+
+```go
+// Create a belief with specific probabilities
+belief, err := types.NewBelief(0.7, 0.2, 0.1)
+if err != nil {
+    // Handle error - values don't sum to 1.0
+}
+// Result: [A:70% D:20% U:10%] → ALIVE
+```
+
+### Using Constructors
+
+Styx provides several convenience constructors:
+
+```go source/types/belief.go
+// Pure uncertainty (initial state)
+func UnknownBelief() Belief {
+    return Belief{
+        alive:   ConfidenceZero(),
+        dead:    ConfidenceZero(),
+        unknown: ConfidenceOne(),
+    }
+}
+// Returns: [A:0% D:0% U:100%] → UNKNOWN
+
+// Certain liveness
+func CertainlyAlive() Belief {
+    return Belief{
+        alive:   ConfidenceOne(),
+        dead:    ConfidenceZero(),
+        unknown: ConfidenceZero(),
+    }
+}
+// Returns: [A:100% D:0% U:0%] → ALIVE
+
+// Certain death
+func CertainlyDead() Belief {
+    return Belief{
+        alive:   ConfidenceZero(),
+        dead:    ConfidenceOne(),
+        unknown: ConfidenceZero(),
+    }
+}
+// Returns: [A:0% D:100% U:0%] → DEAD
+```
+
+<Tip>
+Use `MustBelief(alive, dead, unknown)` if you're certain the values are valid. It panics on error, useful for tests and hardcoded values.
+</Tip>
+
+## Certainty Thresholds
+
+Styx uses thresholds to determine when a belief is "certain" enough:
+
+```go source/types/belief.go
+const CertaintyThreshold = 0.95
+const DominantMargin = 0.1
+
+// IsCertainAlive checks if the node is certainly alive.
+// Returns true only if alive confidence exceeds the certainty threshold.
+func (b Belief) IsCertainAlive() bool {
+    return b.alive.Value() >= CertaintyThreshold
+}
+
+// IsCertainDead checks if the node is certainly dead.
+// Returns true only if dead confidence exceeds the certainty threshold.
+// This triggers irreversible death semantics.
+func (b Belief) IsCertainDead() bool {
+    return b.dead.Value() >= CertaintyThreshold
+}
+```
+
+<Accordion title="CertaintyThreshold = 0.95">
+A node is considered "certainly alive" or "certainly dead" only when the corresponding confidence exceeds 95%. This high bar prevents premature decisions.
+</Accordion>
+
+<Accordion title="DominantMargin = 0.1">
+For a state to be considered dominant, it must exceed the other states by at least 10%. This prevents flapping between states when probabilities are close.
+</Accordion>
+
+## Dominant State
+
+The dominant state is the one with the highest confidence, but only if it exceeds others by the required margin:
+
+```go source/types/belief.go
+func (b Belief) Dominant() BeliefState {
+    alive := b.alive.Value()
+    dead := b.dead.Value()
+    unknown := b.unknown.Value()
+
+    if alive > dead+DominantMargin && alive > unknown+DominantMargin {
+        return StateAlive
+    }
+    if dead > alive+DominantMargin && dead > unknown+DominantMargin {
+        return StateDead
+    }
+    return StateUnknown
+}
+```
+
+### Examples
+
+```go
+// Clear dominance
+b := types.MustBelief(0.8, 0.1, 0.1)
+b.Dominant() // Returns: StateAlive
+
+// No clear dominant (close values)
+b := types.MustBelief(0.45, 0.40, 0.15)
+b.Dominant() // Returns: StateUnknown (margin too small)
+
+// High uncertainty dominates
+b := types.MustBelief(0.1, 0.1, 0.8)
+b.Dominant() // Returns: StateUnknown
+```
+
+## String Representation
+
+Beliefs have a human-readable string format:
+
+```go source/types/belief.go
+func (b Belief) String() string {
+    return fmt.Sprintf("[A:%.0f%% D:%.0f%% U:%.0f%%] → %s",
+        b.alive.Value()*100.0,
+        b.dead.Value()*100.0,
+        b.unknown.Value()*100.0,
+        b.Dominant())
+}
+```
+
+Output examples:
+- `[A:70% D:20% U:10%] → ALIVE`
+- `[A:0% D:0% U:100%] → UNKNOWN`
+- `[A:5% D:90% U:5%] → DEAD`
+
+## Belief States
+
+The `BeliefState` enum represents the three possible dominant states:
+
+```go source/types/belief.go
+type BeliefState int
+
+const (
+    // StateUnknown indicates the liveness state is unknown.
+    StateUnknown BeliefState = iota
+    // StateAlive indicates the node is believed to be alive.
+    StateAlive
+    // StateDead indicates the node is believed to be dead.
+    StateDead
+)
+```
+
+<Note>
+`StateUnknown` is returned both when uncertainty is high AND when no state clearly dominates (due to insufficient margin).
+</Note>
+
+## Validation
+
+Beliefs can be validated to ensure they maintain the invariant:
+
+```go source/types/belief.go
+// IsValid checks that the belief invariant holds.
+// Returns true if alive + dead + unknown ≈ 1.0
+func (b Belief) IsValid() bool {
+    sum := b.alive.Value() + b.dead.Value() + b.unknown.Value()
+    return math.Abs(sum-1.0) < BeliefSumEpsilon
+}
+```
+
+## Common Patterns
+
+### Initial State
+
+When no evidence exists, start with pure uncertainty:
+
+```go
+belief := types.UnknownBelief()
+// [A:0% D:0% U:100%] → UNKNOWN
+```
+
+### After Direct Response
+
+A direct response provides strong evidence of liveness:
+
+```go
+belief := types.MustBelief(0.9, 0.05, 0.05)
+// [A:90% D:5% U:5%] → ALIVE
+```
+
+### After Timeout
+
+A timeout only slightly increases dead probability:
+
+```go
+belief := types.MustBelief(0.3, 0.15, 0.55)
+// [A:30% D:15% U:55%] → UNKNOWN
+// Note: High uncertainty, not declaring dead
+```
+
+### After Multiple Witness Reports
+
+Aggregated witness reports with high agreement:
+
+```go
+belief := types.MustBelief(0.05, 0.85, 0.10)
+// [A:5% D:85% U:10%] → DEAD
+// Note: Still below 95% certainty threshold
+```
+
+### Finalized Death
+
+Only when overwhelming evidence exists:
+
+```go
+belief := types.CertainlyDead()
+// [A:0% D:100% U:0%] → DEAD
+// IsCertainDead() returns true - triggers finality
+```
+
+<Warning>
+Once `IsCertainDead()` returns true, the finality engine declares the node dead permanently. This is **irreversible**.
+</Warning>
+
+## Key Takeaways
+
+<CardGroup cols={2}>
+  <Card title="Always Sum to 1.0" icon="equals">
+    The three components (alive, dead, unknown) must always sum to 1.0 within epsilon tolerance
+  </Card>
+  <Card title="Bounded Values" icon="brackets-curly">
+    Each component is a Confidence in the range [0.0, 1.0], enforced at construction
+  </Card>
+  <Card title="High Certainty Bar" icon="gauge-high">
+    Requires 95%+ confidence for certain alive/dead declarations
+  </Card>
+  <Card title="Dominant Margin" icon="chart-line">
+    A state needs 10%+ margin over others to be considered dominant
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<Card title="Witnesses" icon="users" href="/concepts/witnesses">
+  Learn how witness reports are aggregated into beliefs
+</Card>

@@ -1,0 +1,388 @@
+---
+title: Death Finality
+description: Irreversible death decisions and the finality engine in Styx
+---
+
+Once Styx declares a node dead, that decision is **permanent and irreversible**. The node cannot be resurrected and must rejoin with a new identity. This is enforced by the Finality Engine.
+
+## Why Finality?
+
+Finality prevents several critical problems in distributed systems:
+
+- **Zombie Nodes**: Prevents "dead" nodes from rejoining with stale state
+- **Flapping Identities**: Stops nodes from oscillating between alive/dead
+- **Data Consistency**: Ensures distributed protocols can safely proceed after declaring a node dead
+- **Split-Brain Prevention**: Forces network partition resolution before rejoining
+
+<Warning>
+**False death is catastrophic**. Once declared dead, a node loses its identity. Styx requires overwhelming evidence before making this irreversible decision.
+</Warning>
+
+## The Finality Engine
+
+The Finality Engine maintains the permanent death registry:
+
+```go source/finality/engine.go
+type Engine struct {
+    mu       sync.RWMutex
+    dead     map[types.NodeID]*DeathRecord
+    registry *witness.Registry
+}
+
+type DeathRecord struct {
+    NodeID      types.NodeID
+    FinalBelief types.Belief
+    Witnesses   []types.NodeID
+    Reason      string
+}
+```
+
+### Checking Death Status
+
+```go source/finality/engine.go
+// IsDead checks if a node has been declared dead
+// P14: Once dead, always dead
+func (e *Engine) IsDead(id types.NodeID) bool {
+    e.mu.RLock()
+    defer e.mu.RUnlock()
+    _, exists := e.dead[id]
+    return exists
+}
+```
+
+<Accordion title="Property 14: Death is Final">
+Once a node is in the death registry, `IsDead()` will return `true` forever. There is no way to remove an entry from this registry.
+</Accordion>
+
+## Death Declaration Requirements
+
+Declaring death requires passing **all** of these strict checks:
+
+### 1. Dead Confidence Threshold
+
+```go source/finality/engine.go
+const MinDeadConfidence = 0.85
+
+// Require overwhelming dead confidence
+if aggregatedBelief.Dead().Value() < MinDeadConfidence {
+    return ErrInsufficientEvidence
+}
+```
+
+The aggregated belief must show at least **85% dead confidence**.
+
+### 2. Minimum Witnesses
+
+```go source/finality/engine.go
+const MinWitnesses = 3
+
+// Require multiple witnesses
+if len(witnessReports) < MinWitnesses {
+    return ErrInsufficientEvidence
+}
+```
+
+At least **3 independent witnesses** must report on the node's status.
+
+### 3. Non-Timeout Evidence Required
+
+```go source/finality/engine.go
+const MinNonTimeoutEvidence = 0.3
+
+// P15: Silence alone cannot trigger death
+if !hasNonTimeoutEvidence {
+    return ErrSilenceOnly
+}
+```
+
+<Accordion title="Property 15: Silence ≠ Death">
+Timeouts and lack of response can **never** alone trigger death. There must be positive evidence like crash reports, OS signals, or causal event analysis.
+</Accordion>
+
+### 4. Low Disagreement
+
+```go source/finality/engine.go
+const MaxDisagreement = 0.2
+
+// Check disagreement isn't too high
+disagreement := calculateDisagreement(witnessReports)
+if disagreement > MaxDisagreement {
+    return ErrInsufficientEvidence
+}
+```
+
+Witnesses must have strong agreement (disagreement < 20%).
+
+<Accordion title="Property 13: False Death is Forbidden">
+Declaring a live node dead is worse than leaving a dead node as uncertain. Styx errs heavily on the side of caution.
+</Accordion>
+
+## Death Declaration Flow
+
+```go source/finality/engine.go
+func (e *Engine) DeclareDeath(
+    nodeID types.NodeID,
+    aggregatedBelief types.Belief,
+    witnessReports []witness.WitnessReport,
+    hasNonTimeoutEvidence bool,
+) error {
+    e.mu.Lock()
+    defer e.mu.Unlock()
+
+    // P14: Already dead stays dead
+    if _, exists := e.dead[nodeID]; exists {
+        return ErrAlreadyDead
+    }
+
+    // P13: Require overwhelming dead confidence
+    if aggregatedBelief.Dead().Value() < MinDeadConfidence {
+        return ErrInsufficientEvidence
+    }
+
+    // P13: Require multiple witnesses
+    if len(witnessReports) < MinWitnesses {
+        return ErrInsufficientEvidence
+    }
+
+    // P15: Silence alone cannot trigger death
+    if !hasNonTimeoutEvidence {
+        return ErrSilenceOnly
+    }
+
+    // P10: Check disagreement isn't too high
+    disagreement := calculateDisagreement(witnessReports)
+    if disagreement > MaxDisagreement {
+        return ErrInsufficientEvidence
+    }
+
+    // All checks passed - declare death
+    witnesses := make([]types.NodeID, len(witnessReports))
+    for i, r := range witnessReports {
+        witnesses[i] = r.Witness
+    }
+
+    e.dead[nodeID] = &DeathRecord{
+        NodeID:      nodeID,
+        FinalBelief: aggregatedBelief,
+        Witnesses:   witnesses,
+        Reason:      "overwhelming evidence from multiple witnesses",
+    }
+
+    return nil
+}
+```
+
+## Resurrection is Impossible
+
+```go source/finality/engine.go
+// AttemptResurrection tries to bring back a dead node
+// P14: This must ALWAYS fail
+func (e *Engine) AttemptResurrection(id types.NodeID) error {
+    e.mu.RLock()
+    defer e.mu.RUnlock()
+
+    if _, exists := e.dead[id]; exists {
+        return ErrResurrection
+    }
+    return nil // wasn't dead anyway
+}
+```
+
+<Warning>
+Attempting to resurrect a dead node will **always** fail with `ErrResurrection`. This is by design.
+</Warning>
+
+## Node Identity and Rebirth
+
+When a node needs to rejoin after being declared dead, it must use a **new identity** with an incremented generation counter:
+
+```go source/types/node_id.go
+type NodeID struct {
+    // Base identifier (e.g., hash of address or UUID)
+    Base uint64
+    // Generation counter - incremented on each identity rebirth
+    Generation uint64
+}
+
+// Rebirth creates a new identity for a reborn node.
+// This MUST be used when a node returns after being declared dead.
+// The generation counter is incremented, making this a distinct identity.
+func (n NodeID) Rebirth() NodeID {
+    return NodeID{
+        Base:       n.Base,
+        Generation: n.Generation + 1,
+    }
+}
+```
+
+### Rebirth Example
+
+```go
+// Original node
+original := types.NewNodeID(12345) // 000000000000000012345.g0
+
+// Node is declared dead by finality engine
+engine.DeclareDeath(original, belief, reports, true)
+
+// Node process restarts and needs to rejoin
+reborn := original.Rebirth() // 000000000000000012345.g1
+
+// Reborn node can now join with clean slate
+engine.IsDead(original) // true (old identity still dead)
+engine.IsDead(reborn)   // false (new identity, not in death registry)
+```
+
+<Note>
+The base identifier stays the same, but the generation counter increments. This allows tracking that it's the "same" physical node while treating it as a distinct logical identity.
+</Note>
+
+## Error Conditions
+
+The finality engine returns specific errors for different failure modes:
+
+```go source/finality/engine.go
+var (
+    ErrAlreadyDead          = errors.New("node already declared dead")
+    ErrInsufficientEvidence = errors.New("insufficient evidence for death declaration")
+    ErrSilenceOnly          = errors.New("cannot declare death from silence alone")
+    ErrResurrection         = errors.New("cannot resurrect a dead node")
+)
+```
+
+### Example Error Handling
+
+```go
+err := engine.DeclareDeath(nodeID, belief, reports, false)
+switch err {
+case finality.ErrAlreadyDead:
+    // Node already in death registry
+    log.Info("node already declared dead")
+case finality.ErrSilenceOnly:
+    // Only have timeout evidence, need crash reports
+    log.Warn("insufficient evidence: timeouts alone cannot declare death")
+case finality.ErrInsufficientEvidence:
+    // Confidence too low, or not enough witnesses, or high disagreement
+    log.Warn("evidence does not meet death declaration threshold")
+case nil:
+    // Death successfully declared
+    log.Fatal("node declared permanently dead")
+}
+```
+
+## Decision Examples
+
+### Example 1: Insufficient Confidence
+
+```go
+belief := types.MustBelief(0.2, 0.7, 0.1) // 70% dead
+reports := []WitnessReport{w1, w2, w3}
+
+err := engine.DeclareDeath(nodeID, belief, reports, true)
+// Returns: ErrInsufficientEvidence
+// Reason: Dead confidence 70% < 85% threshold
+```
+
+### Example 2: Not Enough Witnesses
+
+```go
+belief := types.MustBelief(0.05, 0.9, 0.05) // 90% dead
+reports := []WitnessReport{w1, w2} // Only 2 witnesses
+
+err := engine.DeclareDeath(nodeID, belief, reports, true)
+// Returns: ErrInsufficientEvidence
+// Reason: 2 witnesses < 3 minimum
+```
+
+### Example 3: Silence Only
+
+```go
+belief := types.MustBelief(0.05, 0.9, 0.05) // 90% dead
+reports := []WitnessReport{w1, w2, w3}
+hasNonTimeoutEvidence := false // Only timeouts!
+
+err := engine.DeclareDeath(nodeID, belief, reports, hasNonTimeoutEvidence)
+// Returns: ErrSilenceOnly
+// Reason: Silence cannot trigger death (Property 15)
+```
+
+### Example 4: High Disagreement
+
+```go
+belief := types.MustBelief(0.05, 0.9, 0.05)
+reports := []WitnessReport{
+    {Belief: MustBelief(0.8, 0.1, 0.1)},  // Sees alive
+    {Belief: MustBelief(0.1, 0.85, 0.05)}, // Sees dead
+    {Belief: MustBelief(0.1, 0.8, 0.1)},   // Sees dead
+}
+// Disagreement ≈ 0.35
+
+err := engine.DeclareDeath(nodeID, belief, reports, true)
+// Returns: ErrInsufficientEvidence
+// Reason: Disagreement 35% > 20% threshold (likely partition)
+```
+
+### Example 5: Successful Declaration
+
+```go
+belief := types.MustBelief(0.02, 0.95, 0.03) // 95% dead
+reports := []WitnessReport{
+    {Belief: MustBelief(0.05, 0.9, 0.05)},
+    {Belief: MustBelief(0.03, 0.92, 0.05)},
+    {Belief: MustBelief(0.02, 0.95, 0.03)},
+}
+// Disagreement ≈ 0.05
+hasNonTimeoutEvidence := true // Has crash reports
+
+err := engine.DeclareDeath(nodeID, belief, reports, hasNonTimeoutEvidence)
+// Returns: nil (success)
+// Node is now permanently dead
+```
+
+## Integration with Oracle
+
+The Oracle checks finality first before any other processing:
+
+```go source/oracle/oracle.go
+func (o *Oracle) Query(target types.NodeID) QueryResult {
+    // Check if already dead (finality)
+    if o.finality.IsDead(target) {
+        result.Dead = true
+        result.Belief = types.MustBelief(0, 1, 0)
+        result.Evidence = append(result.Evidence, "finality: node declared dead")
+        return result
+    }
+    // ... continue with normal query processing
+}
+```
+
+<Note>
+Once a node is in the death registry, all queries immediately return `[A:0% D:100% U:0%]` without consulting witnesses.
+</Note>
+
+## Key Takeaways
+
+<CardGroup cols={2}>
+  <Card title="Irreversible" icon="lock">
+    Death declarations are permanent. No resurrection is possible.
+  </Card>
+  <Card title="High Bar" icon="gauge-high">
+    Requires 85%+ dead confidence, 3+ witnesses, low disagreement, and non-timeout evidence
+  </Card>
+  <Card title="Silence ≠ Death" icon="volume-xmark">
+    Timeouts alone can never trigger death. Positive evidence required.
+  </Card>
+  <Card title="Rebirth Required" icon="recycle">
+    Dead nodes must rejoin with incremented generation counter
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Partition Detection" icon="split" href="/concepts/partition-detection">
+    Learn how disagreement indicates partitions rather than death
+  </Card>
+  <Card title="Witnesses" icon="users" href="/concepts/witnesses">
+    See how witness reports are aggregated before finality decisions
+  </Card>
+</CardGroup>

@@ -1,0 +1,474 @@
+---
+title: "Witness"
+description: "Witness registry and aggregation for Styx"
+---
+
+The witness system manages trusted witnesses and aggregates their reports into a single belief, implementing trust decay and correlation detection.
+
+## Types
+
+### WitnessReport
+
+A belief report from a single witness about a target node.
+
+```go
+type WitnessReport struct {
+    Witness types.NodeID  // Witness providing the report
+    Target  types.NodeID  // Node being reported on
+    Belief  types.Belief  // Witness's belief about target's liveness
+    Trust   TrustScore    // Trust level of this witness
+}
+```
+
+### WitnessRecord
+
+Tracks a single witness node and its history.
+
+```go
+type WitnessRecord struct {
+    ID             types.NodeID  // Witness identifier
+    Trust          TrustScore    // Current trust score [0.1, 1.0]
+    CorrectReports int           // Number of correct reports
+    WrongReports   int           // Number of incorrect reports
+    LastReport     types.Belief  // Most recent report from this witness
+}
+```
+
+### TrustScore
+
+Represents how much we trust a witness (0.1 to 1.0).
+
+```go
+type TrustScore float64
+
+const (
+    MaxTrust     TrustScore = 1.0  // Full trust in a witness
+    MinTrust     TrustScore = 0.1  // Minimum trust (but never zero)
+    DefaultTrust TrustScore = 0.8  // Trust for new witnesses
+    DecayRate    = 0.1              // Trust decay per incorrect report
+    RecoveryRate = 0.05             // Trust increase per correct report
+)
+```
+
+**Key principle:** Trust is never zero - even unreliable witnesses provide some information.
+
+## Registry
+
+Tracks all known witnesses and their trust levels. Implements **P12: Witness trust decays**.
+
+### Type Definition
+
+```go
+type Registry struct {
+    // Private fields
+}
+```
+
+### Constructor
+
+#### NewRegistry
+
+Creates an empty witness registry.
+
+```go
+func NewRegistry() *Registry
+```
+
+**Example:**
+```go
+registry := witness.NewRegistry()
+```
+
+### Methods
+
+#### Register
+
+Adds a new witness with default trust.
+
+```go
+func (r *Registry) Register(id types.NodeID)
+```
+
+**Parameters:**
+- `id` - The witness to register
+
+**Behavior:**
+- If witness already exists, does nothing
+- New witnesses start with `DefaultTrust` (0.8)
+
+**Example:**
+```go
+witnessID := types.NewNodeID(100)
+registry.Register(witnessID)
+```
+
+#### GetTrust
+
+Returns the trust score for a witness.
+
+```go
+func (r *Registry) GetTrust(id types.NodeID) TrustScore
+```
+
+**Returns:** Trust score, or `DefaultTrust` if witness is unknown
+
+**Example:**
+```go
+trust := registry.GetTrust(witnessID)
+fmt.Printf("Trust: %.2f\n", trust)
+```
+
+#### RecordCorrect
+
+Marks a witness report as correct. Trust increases slightly.
+
+```go
+func (r *Registry) RecordCorrect(id types.NodeID)
+```
+
+**Behavior:**
+- Increments `CorrectReports` counter
+- Increases trust by `RecoveryRate` (0.05)
+- Trust capped at `MaxTrust` (1.0)
+
+**Example:**
+```go
+registry.RecordCorrect(witnessID)
+```
+
+#### RecordWrong
+
+Marks a witness report as wrong. Implements **P12: Trust decays for bad witnesses**.
+
+```go
+func (r *Registry) RecordWrong(id types.NodeID)
+```
+
+**Behavior:**
+- Increments `WrongReports` counter
+- Decreases trust by `DecayRate` (0.1)
+- Trust floored at `MinTrust` (0.1)
+
+**Example:**
+```go
+registry.RecordWrong(witnessID)
+```
+
+#### RecordReport
+
+Stores the latest report from a witness.
+
+```go
+func (r *Registry) RecordReport(id types.NodeID, belief types.Belief)
+```
+
+**Parameters:**
+- `id` - The witness
+- `belief` - The latest belief reported
+
+**Example:**
+```go
+belief := types.MustBelief(0.8, 0.1, 0.1)
+registry.RecordReport(witnessID, belief)
+```
+
+#### AllWitnesses
+
+Returns all registered witness IDs.
+
+```go
+func (r *Registry) AllWitnesses() []types.NodeID
+```
+
+**Example:**
+```go
+witnesses := registry.AllWitnesses()
+for _, w := range witnesses {
+    fmt.Printf("Witness: %s, Trust: %.2f\n", w, registry.GetTrust(w))
+}
+```
+
+#### GetRecord
+
+Returns the full witness record.
+
+```go
+func (r *Registry) GetRecord(id types.NodeID) *WitnessRecord
+```
+
+**Returns:** A copy of the witness record, or `nil` if not found
+
+**Example:**
+```go
+record := registry.GetRecord(witnessID)
+if record != nil {
+    fmt.Printf("Witness %s: %d correct, %d wrong\n",
+        record.ID, record.CorrectReports, record.WrongReports)
+}
+```
+
+## Aggregator
+
+Combines multiple witness reports into a single belief. Implements:
+- **P10: Disagreement is preserved**
+- **P11: Correlated witnesses weaken confidence**
+
+### Type Definition
+
+```go
+type Aggregator struct {
+    // Private fields
+}
+```
+
+### Constructor
+
+#### NewAggregator
+
+Creates an aggregator with a witness registry.
+
+```go
+func NewAggregator(registry *Registry) *Aggregator
+```
+
+**Example:**
+```go
+registry := witness.NewRegistry()
+aggregator := witness.NewAggregator(registry)
+```
+
+### AggregateResult
+
+The result of aggregating witness reports.
+
+```go
+type AggregateResult struct {
+    Belief       types.Belief      // Combined belief
+    Disagreement float64           // Witness disagreement (0-1)
+    WitnessCount int               // Number of reports aggregated
+    Reports      []WitnessReport   // Original reports
+}
+```
+
+**Fields:**
+- `Belief` - The weighted average belief
+- `Disagreement` - Measures variance in witness opinions:
+  - 0.0 = All witnesses agree
+  - 1.0 = Maximum disagreement
+- `WitnessCount` - Number of reports used
+- `Reports` - The original reports for transparency
+
+### Methods
+
+#### Aggregate
+
+Combines multiple witness reports into a single belief.
+
+```go
+func (a *Aggregator) Aggregate(reports []WitnessReport) AggregateResult
+```
+
+**Parameters:**
+- `reports` - Witness reports to aggregate
+
+**Returns:** `AggregateResult` with combined belief and disagreement info
+
+**Key behaviors:**
+
+1. **Weighted averaging:** Reports are weighted by witness trust scores
+2. **P10 - Disagreement preserved:** High variance increases uncertainty
+3. **P11 - Correlation detection:** Too-similar witnesses reduce confidence
+4. **Empty reports:** Returns `UnknownBelief()`
+5. **Single report:** Returns that belief with zero disagreement
+
+**Example:**
+```go
+reports := []witness.WitnessReport{
+    {
+        Witness: w1,
+        Target:  target,
+        Belief:  types.MustBelief(0.9, 0.05, 0.05),
+        Trust:   0.8,
+    },
+    {
+        Witness: w2,
+        Target:  target,
+        Belief:  types.MustBelief(0.85, 0.1, 0.05),
+        Trust:   0.9,
+    },
+}
+
+result := aggregator.Aggregate(reports)
+
+fmt.Printf("Combined belief: %s\n", result.Belief)
+fmt.Printf("Disagreement: %.2f\n", result.Disagreement)
+fmt.Printf("Witnesses: %d\n", result.WitnessCount)
+```
+
+## Implementation Details
+
+### Weighted Aggregation
+
+Reports are combined using weighted averages based on trust:
+
+```go
+// Pseudocode
+totalWeight = sum(trust[i] for each report i)
+avgAlive = sum(belief[i].alive * trust[i]) / totalWeight
+avgDead = sum(belief[i].dead * trust[i]) / totalWeight
+avgUnknown = sum(belief[i].unknown * trust[i]) / totalWeight
+```
+
+### Disagreement Calculation (P10)
+
+Disagreement is measured as variance across witnesses:
+
+```go
+// Pseudocode
+variance = sum((belief[i].alive - avgAlive)^2 + (belief[i].dead - avgDead)^2) / count
+disagreement = min(sqrt(variance), 1.0)
+```
+
+High disagreement (> 0.3) increases uncertainty:
+- Reduces alive and dead confidences
+- Increases unknown confidence
+
+### Correlation Detection (P11)
+
+If witnesses are too similar (correlation > 0.9), they may be correlated:
+
+```go
+// Pseudocode
+for each witness pair:
+    diff = abs(w1.alive - w2.alive) + abs(w1.dead - w2.dead)
+avgDiff = totalDiff / pairs
+correlation = 1.0 - min(avgDiff * 2, 1.0)
+
+if correlation > 0.9:
+    // Reduce confidence by 30%
+    avgAlive *= 0.7
+    avgDead *= 0.7
+    avgUnknown = 1.0 - avgAlive - avgDead
+```
+
+This prevents sybil attacks where many correlated witnesses inflate confidence.
+
+### Trust Decay (P12)
+
+Witness trust evolves based on accuracy:
+
+```go
+// Correct report
+trust = min(trust + 0.05, 1.0)
+
+// Incorrect report
+trust = max(trust - 0.1, 0.1)
+```
+
+Bad witnesses decay faster (0.1) than good witnesses recover (0.05), making the system conservative.
+
+## Usage Examples
+
+### Complete Witness Workflow
+
+```go
+package main
+
+import (
+    "fmt"
+    "github.com/Cintu07/styx/types"
+    "github.com/Cintu07/styx/witness"
+)
+
+func main() {
+    // Create registry and aggregator
+    registry := witness.NewRegistry()
+    aggregator := witness.NewAggregator(registry)
+
+    // Register witnesses
+    w1 := types.NewNodeID(100)
+    w2 := types.NewNodeID(101)
+    w3 := types.NewNodeID(102)
+    
+    registry.Register(w1)
+    registry.Register(w2)
+    registry.Register(w3)
+
+    // Receive reports about a target
+    target := types.NewNodeID(200)
+    
+    reports := []witness.WitnessReport{
+        {
+            Witness: w1,
+            Target:  target,
+            Belief:  types.MustBelief(0.9, 0.05, 0.05),
+        },
+        {
+            Witness: w2,
+            Target:  target,
+            Belief:  types.MustBelief(0.85, 0.1, 0.05),
+        },
+        {
+            Witness: w3,
+            Target:  target,
+            Belief:  types.MustBelief(0.1, 0.8, 0.1), // Disagrees!
+        },
+    }
+
+    // Aggregate reports
+    result := aggregator.Aggregate(reports)
+
+    fmt.Printf("Aggregated belief: %s\n", result.Belief)
+    fmt.Printf("Disagreement: %.2f\n", result.Disagreement)
+    fmt.Printf("Witness count: %d\n", result.WitnessCount)
+
+    if result.Disagreement > 0.3 {
+        fmt.Println("Warning: High disagreement among witnesses!")
+    }
+}
+```
+
+### Managing Witness Trust
+
+```go
+// Track witness accuracy over time
+registry := witness.NewRegistry()
+witnessID := types.NewNodeID(100)
+
+registry.Register(witnessID)
+fmt.Printf("Initial trust: %.2f\n", registry.GetTrust(witnessID))
+
+// Witness provides correct reports
+for i := 0; i < 5; i++ {
+    registry.RecordCorrect(witnessID)
+}
+fmt.Printf("After correct reports: %.2f\n", registry.GetTrust(witnessID))
+
+// Witness provides wrong report
+registry.RecordWrong(witnessID)
+fmt.Printf("After wrong report: %.2f\n", registry.GetTrust(witnessID))
+
+// View full record
+record := registry.GetRecord(witnessID)
+fmt.Printf("Stats: %d correct, %d wrong\n",
+    record.CorrectReports, record.WrongReports)
+```
+
+### Detecting Disagreement
+
+```go
+reports := []witness.WitnessReport{
+    {Witness: w1, Belief: types.MustBelief(0.9, 0.05, 0.05)},
+    {Witness: w2, Belief: types.MustBelief(0.1, 0.85, 0.05)},
+}
+
+result := aggregator.Aggregate(reports)
+
+if result.Disagreement > 0.5 {
+    fmt.Println("Major disagreement detected!")
+    fmt.Println("This could indicate:")
+    fmt.Println("  - Network partition")
+    fmt.Println("  - Flapping node")
+    fmt.Println("  - Witness confusion")
+}
+```

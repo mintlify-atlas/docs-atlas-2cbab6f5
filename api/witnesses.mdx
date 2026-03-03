@@ -1,0 +1,60 @@
+---
+title: 'Witnesses Endpoint'
+description: 'Register a witness node with the oracle'
+---
+
+## POST /witnesses
+
+Register a witness node with the oracle. Witnesses are nodes that provide reports about the liveness of other nodes in the system.
+
+### Request Body
+
+<ParamField body="id" type="uint64" required>
+  The unique ID of the witness node to register
+</ParamField>
+
+### Request Example
+
+```json
+{
+  "id": 1
+}
+```
+
+### Response
+
+<ResponseField name="status" type="string">
+  Status of the registration ("registered")
+</ResponseField>
+
+### Response Example
+
+```json
+{
+  "status": "registered"
+}
+```
+
+### Error Codes
+
+<ResponseField name="400 Bad Request" type="error">
+  Invalid JSON in request body
+</ResponseField>
+
+<ResponseField name="405 Method Not Allowed" type="error">
+  Request method is not POST
+</ResponseField>
+
+### cURL Example
+
+```bash
+curl -X POST http://localhost:8080/witnesses \
+  -H "Content-Type: application/json" \
+  -d '{"id": 1}'
+```
+
+### Notes
+
+- Witnesses must be registered before they can submit reports via the `/report` endpoint
+- Each witness should have a unique ID in the system
+- Registering the same witness ID multiple times is idempotent

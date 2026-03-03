@@ -1,0 +1,180 @@
+---
+title: Introduction
+description: A distributed membership system that doesn't lie - returning probabilities instead of boolean guesses
+---
+
+## What is Styx?
+
+Styx is a distributed membership system that tells you the **truth** about node liveness - even when that truth is "I don't know."
+
+Unlike traditional health checks that return binary alive/dead states, Styx returns probability distributions. When a node is unreachable, it doesn't guess - it says **unknown** instead of potentially lying.
+
+```json
+{
+  "alive_confidence": 0.61,
+  "dead_confidence": 0.19,
+  "unknown": 0.20
+}
+```
+
+## The Problem with Traditional Membership
+
+Most membership systems lie. When the network is slow, they mark nodes as dead even when they're perfectly healthy. This causes:
+
+- Cascading failures from false positives
+- Unnecessary failovers and data loss
+- Split-brain scenarios during partitions
+- Binary decisions based on insufficient evidence
+
+Traditional systems pretend to know things they don't know. A timeout alone isn't enough evidence to declare a node dead.
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Honest Uncertainty" icon="question-circle">
+    Returns `unknown` when evidence is insufficient instead of guessing wrong. No more false positives from slow networks.
+  </Card>
+  
+  <Card title="Probability Distributions" icon="chart-line">
+    Get confidence levels for alive, dead, and unknown states. Make informed decisions based on actual certainty.
+  </Card>
+  
+  <Card title="Partition Detection" icon="network-wired">
+    Refuses to answer during network partitions instead of picking a side. Prevents split-brain scenarios.
+  </Card>
+  
+  <Card title="Death Finality" icon="skull">
+    Death declarations are irreversible and require multiple witnesses. No flapping between states.
+  </Card>
+</CardGroup>
+
+## Core Principles
+
+Styx is built on five fundamental rules:
+
+1. **If unsure, say unknown** - Don't guess when you lack evidence
+2. **Death is permanent** - Once declared dead, a node can't come back (prevents flapping)
+3. **Multiple witnesses required** - No single point of failure for death decisions
+4. **Refuse during partitions** - When witnesses disagree, refuse to answer
+5. **Timeout alone is not enough** - Need corroborating evidence beyond a single timeout
+
+## How It Works
+
+Styx aggregates reports from multiple **witnesses** - nodes that actively monitor target nodes. Each witness submits belief distributions:
+
+```go
+// From source/types/belief.go:60-86
+type Belief struct {
+    alive   Confidence  // 0.0 to 1.0
+    dead    Confidence  // 0.0 to 1.0
+    unknown Confidence  // 0.0 to 1.0
+}
+// Invariant: alive + dead + unknown = 1.0
+```
+
+The Oracle aggregates these beliefs and detects disagreement patterns:
+
+```go
+// From source/oracle/oracle.go:100-104
+func (o *Oracle) Query(target types.NodeID) QueryResult {
+    return o.QueryWithRequirement(target, DefaultRequirement)
+}
+```
+
+When witnesses strongly disagree (e.g., some see alive, others see dead), Styx detects a partition and **refuses to answer**:
+
+```go
+// From source/partition/detector.go:98-100
+if disagreement > d.disagreementThreshold {
+    // Confirmed split - some see alive, some see dead
+    d.state = ConfirmedPartition
+```
+
+## Why Styx is Different
+
+| Traditional Systems | Styx |
+|---------------------|------|
+| Returns boolean (alive/dead) | Returns probability distribution |
+| Guesses during uncertainty | Says "unknown" explicitly |
+| Timeout = dead | Timeout = evidence, not conclusion |
+| Nodes can flap between states | Death is permanent (finality) |
+| Picks a side during partition | Refuses to answer |
+| Single source of truth | Aggregates multiple witnesses |
+
+## Real-World Example
+
+A node becomes temporarily unreachable due to network congestion:
+
+**Traditional system:**
+```json
+{"alive": false}  // Wrong! Node is actually fine
+```
+
+**Styx:**
+```json
+{
+  "alive_confidence": 0.3,
+  "dead_confidence": 0.2,
+  "unknown": 0.5,
+  "refused": false
+}
+```
+
+Styx admits uncertainty instead of making a potentially catastrophic wrong decision.
+
+## Quick Example
+
+Query a node's status:
+
+```bash
+curl "http://localhost:8080/query?target=42"
+```
+
+Response:
+```json
+{
+  "target": 42,
+  "alive_confidence": 0.61,
+  "dead_confidence": 0.19,
+  "unknown": 0.20,
+  "refused": false,
+  "witness_count": 5,
+  "disagreement": 0.15,
+  "partition_state": "NO_PARTITION"
+}
+```
+
+## Architecture
+
+```
+┌─────────────┐
+│  Witnesses  │ ───┐
+└─────────────┘    │
+                   │  Submit Reports
+┌─────────────┐    │  (Belief Distributions)
+│  Witnesses  │ ───┤
+└─────────────┘    │
+                   ▼
+              ┌──────────┐
+              │  Oracle  │
+              └──────────┘
+                   │
+        ┌──────────┼──────────┐
+        ▼          ▼          ▼
+   Aggregator  Partition  Finality
+                Detector   Engine
+```
+
+## Get Started
+
+Ready to build a membership system that doesn't lie?
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get Styx running in 5 minutes
+  </Card>
+  
+  <Card title="Installation" icon="download" href="/installation">
+    Install via Docker, Go, or build from source
+  </Card>
+</CardGroup>

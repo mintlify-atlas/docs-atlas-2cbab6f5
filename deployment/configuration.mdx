@@ -1,0 +1,405 @@
+---
+title: "Configuration"
+description: "Configuration options and environment variables for Styx"
+---
+
+## Configuration Overview
+
+Styx can be configured through environment variables, command-line arguments, and runtime parameters.
+
+## Environment Variables
+
+### Server Configuration
+
+<ParamField path="STYX_NODE_ID" type="integer" default="1">
+  Unique identifier for the Styx node in the cluster. Each node must have a distinct ID.
+</ParamField>
+
+<ParamField path="STYX_SERVER" type="string" default="http://localhost:8080">
+  Server URL for the Styx CLI client to connect to the oracle.
+</ParamField>
+
+## Command-Line Arguments
+
+### Styx Server
+
+The `styx-server` binary accepts an optional port argument:
+
+```bash
+./styx-server [port]
+```
+
+<ParamField path="port" type="string" default="8080">
+  Port number for the HTTP server to listen on.
+</ParamField>
+
+**Example**:
+
+```bash
+# Run on default port 8080
+./styx-server
+
+# Run on custom port 9090
+./styx-server 9090
+```
+
+### Styx CLI
+
+The `styx` CLI tool supports multiple commands:
+
+<CodeGroup>
+
+```bash Query Node Status
+styx query <node_id>
+```
+
+```bash Submit Witness Report
+styx report <witness> <target> <alive> <dead> <unknown>
+```
+
+```bash Health Check
+styx health
+```
+
+```bash Version
+styx version
+```
+
+</CodeGroup>
+
+## Docker Configuration
+
+### Docker Run
+
+Configure Styx using environment variables with Docker:
+
+```bash
+docker run -d \
+  --name styx \
+  -p 8080:8080 \
+  -e STYX_NODE_ID=1 \
+  styx:latest
+```
+
+### Docker Compose
+
+Set environment variables in your `docker-compose.yml`:
+
+```yaml
+version: '3.8'
+
+services:
+  styx:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - STYX_NODE_ID=1
+    restart: unless-stopped
+```
+
+## Kubernetes Configuration
+
+### ConfigMap
+
+Create a ConfigMap for centralized configuration:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: styx-config
+data:
+  node_id: "1"
+  port: "8080"
+```
+
+### Environment Variables in Deployment
+
+Inject configuration into pods:
+
+<CodeGroup>
+
+```yaml Direct Values
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: styx
+spec:
+  template:
+    spec:
+      containers:
+        - name: styx
+          image: styx:latest
+          env:
+            - name: STYX_NODE_ID
+              value: "1"
+```
+
+```yaml From ConfigMap
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: styx
+spec:
+  template:
+    spec:
+      containers:
+        - name: styx
+          image: styx:latest
+          env:
+            - name: STYX_NODE_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: styx-config
+                  key: node_id
+```
+
+```yaml From Secret
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: styx
+spec:
+  template:
+    spec:
+      containers:
+        - name: styx
+          image: styx:latest
+          env:
+            - name: STYX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: styx-secrets
+                  key: api-key
+```
+
+</CodeGroup>
+
+## Server Endpoints
+
+The Styx server exposes the following HTTP endpoints:
+
+### Health Check
+
+```bash
+GET /health
+```
+
+Returns server health status. Used by Docker and Kubernetes health probes.
+
+### Query Node Status
+
+```bash
+GET /query?target=<node_id>
+```
+
+Query the status of a specific node. Returns confidence scores for alive, dead, and unknown states.
+
+**Response Example**:
+
+```json
+{
+  "alive_confidence": 0.85,
+  "dead_confidence": 0.10,
+  "unknown": 0.05,
+  "dead": false,
+  "refused": false,
+  "refusal_reason": ""
+}
+```
+
+### Submit Witness Report
+
+```bash
+POST /report
+```
+
+Submit a witness report about a target node.
+
+**Request Body**:
+
+```json
+{
+  "witness": 1,
+  "target": 2,
+  "alive": 0.9,
+  "dead": 0.05,
+  "unknown": 0.05
+}
+```
+
+### Register Witness
+
+```bash
+POST /witnesses
+```
+
+Register a new witness node in the system.
+
+## CLI Configuration
+
+### Setting Server URL
+
+Configure the CLI to connect to a remote Styx server:
+
+<CodeGroup>
+
+```bash Environment Variable
+export STYX_SERVER=http://styx.example.com:8080
+styx health
+```
+
+```bash Inline
+STYX_SERVER=http://styx.example.com:8080 styx query 1
+```
+
+```bash Default (localhost)
+styx health
+# Uses http://localhost:8080
+```
+
+</CodeGroup>
+
+## Production Configuration
+
+### Recommended Settings
+
+<CodeGroup>
+
+```yaml Docker Compose
+version: '3.8'
+
+services:
+  styx:
+    image: styx:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - STYX_NODE_ID=${NODE_ID:-1}
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+```
+
+```yaml Kubernetes
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: styx-production
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: styx
+          image: styx:latest
+          env:
+            - name: STYX_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+```
+
+</CodeGroup>
+
+## Logging
+
+Styx logs to standard output. Configure log aggregation:
+
+<CodeGroup>
+
+```bash Docker Logs
+docker logs -f styx
+```
+
+```bash Kubernetes Logs
+kubectl logs -l app=styx --tail=100 -f
+```
+
+```bash JSON Logging (with jq)
+kubectl logs -l app=styx | jq
+```
+
+</CodeGroup>
+
+## Security Considerations
+
+1. **Network Policies**: Restrict ingress/egress traffic in Kubernetes
+2. **TLS**: Use a reverse proxy (nginx, Envoy) for HTTPS termination
+3. **Authentication**: Implement API authentication for production deployments
+4. **Resource Limits**: Always set CPU and memory limits
+5. **Health Checks**: Configure liveness and readiness probes
+
+## Troubleshooting
+
+### Check Configuration
+
+<CodeGroup>
+
+```bash Docker
+docker inspect styx | jq '.[0].Config.Env'
+```
+
+```bash Kubernetes
+kubectl describe pod <pod-name> | grep -A 10 Environment
+```
+
+```bash Test Endpoint
+curl http://localhost:8080/health
+```
+
+</CodeGroup>
+
+### Common Issues
+
+**Port Already in Use**:
+
+```bash
+# Find process using port 8080
+lsof -i :8080
+
+# Use a different port
+./styx-server 9090
+```
+
+**Connection Refused**:
+
+```bash
+# Check if server is running
+ps aux | grep styx-server
+
+# Set correct server URL
+export STYX_SERVER=http://correct-host:8080
+```

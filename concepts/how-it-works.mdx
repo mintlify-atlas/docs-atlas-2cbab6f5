@@ -1,0 +1,207 @@
+---
+title: How Styx Works
+description: System architecture and core principles of the Styx failure oracle
+---
+
+Styx is a distributed failure oracle that treats node liveness as a **probability distribution** rather than a binary state. Instead of answering "is this node alive?", Styx provides a belief distribution across three states: ALIVE, DEAD, and UNKNOWN.
+
+## Architecture Overview
+
+Styx is built on a multi-layered architecture that combines evidence gathering, witness aggregation, partition detection, and finality enforcement.
+
+```
+┌─────────────────────────────────────────┐
+│           Oracle (Main API)             │
+│  - Query interface                      │
+│  - Never returns boolean                │
+│  - Can refuse to answer                 │
+└──────────────┬──────────────────────────┘
+               │
+      ┌────────┴────────┐
+      │                 │
+┌─────▼──────┐    ┌────▼──────────┐
+│  Finality  │    │  Partition    │
+│  Engine    │    │  Detector     │
+│            │    │               │
+│ - P13-P15  │    │ - Split       │
+│ - Death is │    │   realities   │
+│   final    │    │ - Refuses     │
+└────────────┘    │   on split    │
+                  └───────────────┘
+                         │
+                  ┌──────▼──────────┐
+                  │   Aggregator    │
+                  │                 │
+                  │ - P10: Preserve │
+                  │   disagreement  │
+                  │ - P11: Detect   │
+                  │   correlation   │
+                  └────────┬────────┘
+                           │
+                  ┌────────▼────────┐
+                  │  Witness        │
+                  │  Registry       │
+                  │                 │
+                  │ - P12: Trust    │
+                  │   decay         │
+                  └─────────────────┘
+```
+
+## Core Components
+
+### Oracle
+
+The Oracle is the main API interface. It never returns a boolean, always a belief distribution:
+
+```go
+type QueryResult struct {
+    Target         types.NodeID
+    Belief         types.Belief
+    Refused        bool
+    RefusalReason  string
+    Dead           bool
+    WitnessCount   int
+    Disagreement   float64
+    PartitionState partition.PartitionState
+    Evidence       []string
+}
+```
+
+<Note>
+The Oracle can **refuse to answer** when there's insufficient evidence or a network partition is detected. This is a feature, not a bug.
+</Note>
+
+### Evidence System
+
+Evidence is the foundation of Styx's belief system. Each piece of evidence has:
+- **Kind**: DirectResponse, Timeout, WitnessReport, CausalEvent, etc.
+- **Weight**: How much this evidence matters (0.0 to 1.0)
+- **Timestamp**: When the evidence was observed
+- **Details**: Kind-specific metadata
+
+```go source/evidence/evidence.go
+type Evidence struct {
+    Kind      EvidenceKind
+    Timestamp styxtime.LogicalTimestamp
+    Weight    float64
+    Source    types.NodeID
+    Target    types.NodeID
+    Details   EvidenceDetails
+}
+```
+
+<Warning>
+**Critical Principle**: Absence of evidence is NOT evidence of absence. Timeouts have very low weight (0.1-0.3) and can never alone trigger death.
+</Warning>
+
+### Witness System
+
+Witnesses report their observations about other nodes. Each witness has a **trust score** that:
+- Starts at 0.8 (DefaultTrust)
+- Increases by 0.05 for correct reports (RecoveryRate)
+- Decreases by 0.1 for incorrect reports (DecayRate)
+- Never drops below 0.1 (MinTrust)
+
+See [Witnesses](/concepts/witnesses) for more details.
+
+### Partition Detection
+
+Styx actively detects network partitions by analyzing witness disagreement. When witnesses split into groups with conflicting views (some see ALIVE, some see DEAD), Styx **refuses to answer** rather than guess.
+
+See [Partition Detection](/concepts/partition-detection) for more details.
+
+### Finality Engine
+
+Once a node is declared dead (with overwhelming evidence from multiple witnesses), that decision is **irreversible**. The node must use a new identity (incremented generation) to rejoin.
+
+See [Death Finality](/concepts/finality) for more details.
+
+## Key Principles
+
+Styx is built on several core principles:
+
+<Accordion title="Property 4: No Evidence = No Conclusion">
+If there's no evidence about a node, Styx returns `UnknownBelief()` with 100% unknown. It never guesses.
+</Accordion>
+
+<Accordion title="Property 6: Load ≠ Failure">
+GC pauses and scheduling jitter do NOT indicate failure. Styx actively detects and compensates for these.
+</Accordion>
+
+<Accordion title="Property 10: Disagreement is Preserved">
+When witnesses disagree, Styx tracks and reports the disagreement level rather than hiding it.
+</Accordion>
+
+<Accordion title="Property 11: Correlated Witnesses Weaken Confidence">
+If all witnesses are too similar (correlation > 0.9), confidence is reduced by 30% to account for potential shared failure modes.
+</Accordion>
+
+<Accordion title="Property 12: Witness Trust Decays">
+Witnesses that provide incorrect reports gradually lose trust, reducing their influence on future decisions.
+</Accordion>
+
+<Accordion title="Property 13: False Death is Forbidden">
+Declaring a live node dead is catastrophic. Requires 85%+ dead confidence, 3+ witnesses, and non-timeout evidence.
+</Accordion>
+
+<Accordion title="Property 14: Death is Final">
+Once declared dead, a node cannot be resurrected. It must rejoin with a new identity (incremented generation).
+</Accordion>
+
+<Accordion title="Property 15: Silence ≠ Death">
+Timeouts and silence alone can NEVER trigger death. Non-timeout evidence (crash signals, OS reports) is required.
+</Accordion>
+
+## Belief Distribution Example
+
+Here's how Styx represents beliefs:
+
+```go
+// Pure uncertainty (initial state)
+b := types.UnknownBelief()
+// Returns: [A:0% D:0% U:100%] → UNKNOWN
+
+// After receiving evidence
+b, _ := types.NewBelief(0.7, 0.2, 0.1)
+// Returns: [A:70% D:20% U:10%] → ALIVE
+
+// High dead confidence
+b, _ := types.NewBelief(0.1, 0.85, 0.05)
+// Returns: [A:10% D:85% U:5%] → DEAD
+```
+
+<Tip>
+The dominant state requires a margin of 0.1 (10%) to be declared. If no state is clearly dominant, the result is UNKNOWN.
+</Tip>
+
+## Query Flow
+
+1. **Check Finality**: Is the node already declared dead?
+2. **Gather Reports**: Collect all witness reports for the target
+3. **Detect Partition**: Are witnesses split into conflicting groups?
+4. **Aggregate Beliefs**: Combine witness reports (trust-weighted average)
+5. **Check Confidence**: Does the result meet the required confidence thresholds?
+6. **Return or Refuse**: Return belief distribution, or refuse if uncertain
+
+```go source/oracle/oracle.go
+func (o *Oracle) Query(target types.NodeID) QueryResult {
+    return o.QueryWithRequirement(target, DefaultRequirement)
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Beliefs" icon="chart-line" href="/concepts/beliefs">
+    Learn about probability distributions and confidence values
+  </Card>
+  <Card title="Witnesses" icon="users" href="/concepts/witnesses">
+    Understand the witness reporting and trust system
+  </Card>
+  <Card title="Finality" icon="lock" href="/concepts/finality">
+    Explore death finality and irreversible decisions
+  </Card>
+  <Card title="Partition Detection" icon="split" href="/concepts/partition-detection">
+    See how Styx detects and handles network partitions
+  </Card>
+</CardGroup>
